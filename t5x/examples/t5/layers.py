@@ -80,8 +80,8 @@ def performer_dot_product_attention(query: Array,
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
   
-  queries = nn.relu(query) 
-  keys = nn.relu(key) 
+  queries = nn.relu(query) + numerical_stabilizer 
+  keys = nn.relu(key) + numerical_stabilizer
 
   ## We then do a transposition. ##
   queries = jnp.transpose(queries, [1, 0, 2, 3]) # -> this is [q_length, batch, num_heads, qk_depth_per_head].
