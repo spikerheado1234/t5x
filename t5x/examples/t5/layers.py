@@ -47,6 +47,77 @@ Initializer = Callable[[PRNGKey, Shape, DType], Array]
 default_embed_init = nn.initializers.variance_scaling(
     1.0, 'fan_in', 'normal', out_axis=0)
 
+## We define all the other attention mechanisms over here. ##
+def performer_dot_product_attention(query: Array,
+                          key: Array,
+                          value: Array,
+                          bias: Optional[Array] = None,
+                          dropout_rng: Optional[PRNGKey] = None,
+                          dropout_rate: float = 0.,
+                          deterministic: bool = False,
+                          dtype: DType = jnp.float32,
+                          float32_logits: bool = False,
+                          numerical_stabilizer=0.001):
+  """
+  Computes dot-product multi-head self-attention Performer-Style.
+
+  The inputs are the following shape:
+
+  query: `[batch, q_length, num_heads, qk_depth_per_head]`.
+    key: `[batch, kv_length, num_heads, qk_depth_per_head]`.
+    value: `[batch, kv_length, num_heads, v_depth_per_head]`. 
+  """
+  assert key.ndim == query.ndim == value.ndim, 'q, k, v must have same rank.'
+  assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], (
+      'q, k, v batch dims must match.')
+  assert query.shape[-2] == key.shape[-2] == value.shape[-2], (
+      'q, k, v num_heads must match.')
+  assert key.shape[-3] == value.shape[-3], 'k, v lengths must match.'
+  assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'
+
+  # Casting logits and softmax computation for float32 for model stability.
+  if float32_logits:
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
+  
+  queries = nn.relu(query) 
+  keys = nn.relu(key) 
+
+  ## We then do a transposition. ##
+  queries = jnp.transpose(queries, [1, 0, 2, 3]) # -> this is [q_length, batch, num_heads, qk_depth_per_head].
+  keys = jnp.transpose(keys, [1, 0, 2, 3])
+  values = jnp.transpose(values, [1, 0, 2, 3])
+
+  if bias:
+    ## This is in the decoder. ##
+
+    ## We take an outer-product. ##
+    sums = jnp.einsum("lbhm, lbhd -> lbhmd", keys, values)
+    ## We take the cumulative sum across the sequence dimension. ##
+    jnp.cumsum(sums, axis=0)
+    ## Finally, we do the query * sum multiplication. ##
+    a_v = jnp.einsum("lbhkd,lbhk -> lbhd", sums, queries)
+
+    normalizer = jnp.cumsum(keys, axis=0)
+    normalizer = jnp.reduce_sum(queries * normalizer, axis=3) 
+  else:
+    ## This is a bi-diretional attention present in the encoder only. ##
+    ## This is an outer-product of the last dimension followed by a reduction across the sequence_length dimension. ##
+    ## It ensures that causality is not violated. ##
+    kvs = jnp.einsum("lbhm,lbhd->bhmd", keys, values) # -> this is [batch, num_heads, hidden_dim, hidden_dim].
+    a_v = jnp.einsum("lbhm,bhmd->lbhd", queries, kvs) # -> this is [query_length, batch, num_heads, hidden_dimension].
+    ## Non-causal denominator. ##
+    ks_sum = jnp.einsum("lbhm->bhm", keys)
+    normalizer = jnp.einsum("lbhm,bhm->lbh", queries, ks_sum)
+
+  ## Then we transpose back and do the normalization. ##
+  a_v = jnp.transpose(a_v, [1, 0, 2, 3]) # -> this is [batch, query_length, num_heads, hidden_dimension].
+  normalizer = jnp.transpose(normalizer, [1, 0, 2])
+  normalizer = jnp.expand_dims(normalizer, len(normalizer.shape))
+
+  ## Return a: [batch, num_heads, query_length, key/value_length] matrix. ##
+  return a_v / normalizer
+
 
 def dot_product_attention(query: Array,
                           key: Array,
@@ -95,6 +166,7 @@ def dot_product_attention(query: Array,
   if float32_logits:
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
+    value = value.astype(jnp.float32)
 
   # `attn_weights`: [batch, num_heads, q_length, kv_length]
   attn_weights = jnp.einsum('bqhd,bkhd->bhqk', query, key)
