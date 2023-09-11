@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -374,6 +374,7 @@ def infer(
     output_vocab_feature_name: str = 'targets',
     file_extension: str = 'jsonl',
     keep_aux_as_numpy: bool = False,
+    use_orbax: bool = False,
 ):
   """Infer function.
 
@@ -417,6 +418,7 @@ def infer(
     file_extension: str. file extension used for file names
     keep_aux_as_numpy: bool. whether to leave aux values as numpy arrays; can be
       used to save space when saving bfloat16s
+    use_orbax: if True, uses Orbax for checkpointing. Experimental feature.
   """
   jax.monitoring.record_event('/jax/t5x/infer/beacon')
   logging.info('Process ID: %d', jax.process_index())
@@ -442,7 +444,9 @@ def infer(
   if dataset_cfg.module:
     utils.import_module(dataset_cfg.module)
   host_shard_info = seqio.ShardInfo(index=shard_id, num_shards=num_shards)
-  task_or_mixture = seqio.get_mixture_or_task(dataset_cfg.mixture_or_task_name)
+  task_or_mixture = seqio.maybe_get_mixture_or_task(
+      dataset_cfg.mixture_or_task_name
+  )
 
   feature_converter = model.FEATURE_CONVERTER_CLS(pack=False)
 
@@ -490,11 +494,20 @@ def infer(
 
   # Disable strictness since we are dropping the optimizer state.
   restore_checkpoint_cfg.strict = False
-
   if fallback_init_rng is not None:
     fallback_init_rng = jax.random.PRNGKey(fallback_init_rng)
-  train_state = train_state_initializer.from_checkpoint(
-      [restore_checkpoint_cfg], init_rng=fallback_init_rng)
+
+  train_state, _ = utils.create_checkpoint_manager_and_restore(
+      train_state_initializer,
+      partitioner,
+      restore_checkpoint_cfg,
+      restore_checkpoint_cfg.path,
+      fallback_init_rng,
+      use_orbax=use_orbax,
+  )
+  if train_state is None:
+    raise ValueError('TrainState was not found or could not be restored.')
+
   if mode == 'predict':
     infer_step = model.predict_batch
   elif mode == 'predict_with_aux':
@@ -683,12 +696,12 @@ if __name__ == '__main__':
   # pylint:disable=g-import-not-at-top
   from absl import app
   from absl import flags
+  import fiddle as fdl
   import gin
+  from t5x import config_utils
   # pylint:enable=g-import-not-at-top
 
   FLAGS = flags.FLAGS
-
-  jax.config.parse_flags_with_absl()
 
   flags.DEFINE_integer(
       'shard_id',
@@ -735,39 +748,58 @@ if __name__ == '__main__':
       seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
 
 
-    # Create gin-configurable version of `infer`.
-    infer_using_gin = gin.configurable(infer)
-
-    gin_utils.parse_gin_flags(
-        # User-provided gin paths take precedence if relative paths conflict.
-        FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
-        FLAGS.gin_file,
-        FLAGS.gin_bindings)
-
-    # See http://yaqs/7882016229479677952 for further gin-config discussion.
-    def _get_gin_parameter(key: str) -> Any:
-      value = gin.query_parameter(key)
-      if isinstance(value, gin.config.ConfigurableReference):
-        if value.evaluate:
-          return value.scoped_configurable_fn()
-        return value.scoped_configurable_fn
-      return value
-
-    shard_id = (
-        FLAGS.shard_id
-        if FLAGS.shard_id is not None else _get_gin_parameter('infer.shard_id'))
-    if shard_id == 0:
-      gin_utils.summarize_gin_config(
-          model_dir=_get_gin_parameter('infer.output_dir'),
-          summary_writer=None,
-          step=0)
-    if FLAGS.shard_id is not None:
-      # We fall back to this flag since XM does not support sweeps over flags
-      # with '.' in them (it treats them like nested dictionaries).
-      # TODO(adarob): Figure out a workaround so we can deprecate this flag.
-      infer_using_gin(shard_id=FLAGS.shard_id)
+    if config_utils.using_fdl():
+      config = config_utils.config_with_fiddle(infer)
+      shard_id = FLAGS.shard_id
+      if shard_id is not None:
+        config.shard_id = shard_id
+      infer_with_fiddle = fdl.build(config)
+      if shard_id == 0:
+        config_utils.direct_summarize_fiddle_config(
+            model_dir=infer_with_fiddle.output_dir,
+            summary_writer=None,
+            step=0,
+            get_current_fiddle_config=lambda: infer_with_fiddle,
+        )
+      infer_with_fiddle()
     else:
-      infer_using_gin()
+      # Create gin-configurable version of `infer`.
+      infer_using_gin = gin.configurable(infer)
+
+      gin_utils.parse_gin_flags(
+          # User-provided gin paths take precedence if relative paths conflict.
+          FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
+          FLAGS.gin_file,
+          FLAGS.gin_bindings,
+      )
+
+      # See http://yaqs/7882016229479677952 for further gin-config discussion.
+      def _get_gin_parameter(key: str) -> Any:
+        value = gin.query_parameter(key)
+        if isinstance(value, gin.config.ConfigurableReference):
+          if value.evaluate:
+            return value.scoped_configurable_fn()
+          return value.scoped_configurable_fn
+        return value
+
+      shard_id = (
+          FLAGS.shard_id
+          if FLAGS.shard_id is not None
+          else _get_gin_parameter('infer.shard_id')
+      )
+      if shard_id == 0:
+        gin_utils.summarize_gin_config(
+            model_dir=_get_gin_parameter('infer.output_dir'),
+            summary_writer=None,
+            step=0,
+        )
+      if FLAGS.shard_id is not None:
+        # We fall back to this flag since XM does not support sweeps over flags
+        # with '.' in them (it treats them like nested dictionaries).
+        # TODO(adarob): Figure out a workaround so we can deprecate this flag.
+        infer_using_gin(shard_id=FLAGS.shard_id)
+      else:
+        infer_using_gin()
 
 
-  gin_utils.run(main)
+  config_utils.run(main)

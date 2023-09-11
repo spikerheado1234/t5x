@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@ from version import __version__  # pylint: disable=g-import-not-at-top
 with open('README.md') as fp:
   _LONG_DESCRIPTION = fp.read()
 
-_jax_version = '0.4.3'
-_jaxlib_version = '0.4.3'
+_jax_version = '0.4.11'
+_jaxlib_version = '0.4.11'
 
 setuptools.setup(
     name='t5x',
@@ -54,12 +54,19 @@ setuptools.setup(
         'gin-config',
         f'jax >= {_jax_version}',
         f'jaxlib >= {_jaxlib_version}',
-        'jestimator',
+        (
+            'jestimator @'
+            ' git+https://github.com/google-research/jestimator#egg=jestimator'
+        ),
         'numpy',
-        'orbax @ git+https://github.com/google/orbax#egg=orbax',
+        'optax @ git+https://github.com/deepmind/optax#egg=optax',
+        'orbax-checkpoint',
         'seqio @ git+https://github.com/google/seqio#egg=seqio',
         'tensorflow-cpu',
         'tensorstore >= 0.1.20',
+        # remove this when sentencepiece_model_pb2 is re-generated in the
+        # sentencepiece package.
+        'protobuf==3.20.3',
     ],
     extras_require={
         'gcp': [
@@ -80,7 +87,9 @@ setuptools.setup(
             'gdown==4.5.3',
             'best-download==0.0.9',
             'lm_dataformat==0.0.20',
+            'dllogger@git+https://github.com/NVIDIA/dllogger#egg=dllogger',
             'tfds-nightly==4.6.0.dev202210040045',
+            't5==0.9.4',
         ],
     },
     classifiers=[

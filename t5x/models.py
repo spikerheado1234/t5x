@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,9 +20,12 @@ steps.
 """
 
 import abc
+import dataclasses
 import functools
+import inspect
 from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple, Union
 
+from absl import logging
 import clu.metrics as clu_metrics
 from flax import core as flax_core
 from flax import linen as nn
@@ -40,7 +43,9 @@ from t5x import optimizers
 import tensorflow as tf
 import typing_extensions
 
-Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
+# Remove _ShardedDeviceArray when users of t5x have their types updated
+_ShardedDeviceArray = Any
+Array = Union[np.ndarray, jnp.ndarray, _ShardedDeviceArray, tf.Tensor]
 MetricsMap = metrics_lib.MetricsMap
 PyTree = Any
 PyTreeDef = jax.tree_util.PyTreeDef
@@ -68,10 +73,18 @@ class TokensIdsToLogitsCallable(typing_extensions.Protocol):
 class DecodeFnCallable(typing_extensions.Protocol):
   """Decoding function call signature."""
 
-  def __call__(self, *, inputs: jnp.ndarray, cache: Mapping[str, jnp.ndarray],
-               tokens_to_logits: TokensIdsToLogitsCallable, eos_id: int,
-               num_decodes: int, decode_rng: Optional[jax.random.KeyArray],
-               cache_offset: int, **kwargs) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  def __call__(
+      self,
+      *,
+      inputs: jnp.ndarray,
+      cache: Mapping[str, jnp.ndarray],
+      tokens_to_logits: TokensIdsToLogitsCallable,
+      eos_id: int,
+      num_decodes: int,
+      decode_rng: Optional[jax.random.KeyArray],
+      cache_offset: int,
+      **kwargs,
+  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Decoding function interface.
 
     Args:
@@ -214,7 +227,7 @@ class BaseModel(abc.ABC):
       self,
       rng: jax.random.KeyArray,
       input_shapes: Mapping[str, Array],
-      input_types: Optional[Mapping[str, jnp.dtype]] = None
+      input_types: Optional[Mapping[str, jnp.dtype]] = None,
   ) -> flax_scope.FrozenVariableDict:
     """Returns the initial variables of the model."""
     pass
@@ -236,8 +249,9 @@ class BaseTransformerModel(BaseModel):
       decode_fn: Optional[DecodeFnCallable] = None,
       label_smoothing: float = 0.0,
       z_loss: float = 0.0,
-      loss_normalizing_factor: Optional[Union[
-          float, int, str, losses.SpecialLossNormalizingFactor]] = None,
+      loss_normalizing_factor: Optional[
+          Union[float, int, str, losses.SpecialLossNormalizingFactor]
+      ] = None,
   ):
     self.module = module
     self._input_vocabulary = input_vocabulary
@@ -280,11 +294,14 @@ class BaseTransformerModel(BaseModel):
     """Loss function used for training with a cross-entropy loss."""
     logits = self._compute_logits(params, batch, dropout_rng)
 
-    loss_normalizing_factor: Optional[Union[
-        float, int, str, losses.SpecialLossNormalizingFactor]]
-    (loss_normalizing_factor,
-     weights) = losses.get_loss_normalizing_factor_and_weights(
-         self._loss_normalizing_factor, batch)
+    loss_normalizing_factor: Optional[
+        Union[float, int, str, losses.SpecialLossNormalizingFactor]
+    ]
+    (loss_normalizing_factor, weights) = (
+        losses.get_loss_normalizing_factor_and_weights(
+            self._loss_normalizing_factor, batch
+        )
+    )
 
     loss, z_loss, _ = losses.compute_weighted_cross_entropy(
         logits,
@@ -292,11 +309,12 @@ class BaseTransformerModel(BaseModel):
         weights=weights,
         label_smoothing=self._label_smoothing,
         z_loss=self._z_loss,
-        loss_normalizing_factor=loss_normalizing_factor)
+        loss_normalizing_factor=loss_normalizing_factor,
+    )
 
     # segment ids to compute packing, padding etc.
     segment_ids = {
-        k[:-len('_segment_ids')]: v
+        k[: -len('_segment_ids')]: v
         for k, v in batch.items()
         if k.endswith('_segment_ids')
     }
@@ -314,7 +332,8 @@ class BaseTransformerModel(BaseModel):
         mask=weights,
         loss=loss,
         z_loss=z_loss,
-        segment_ids=segment_ids)
+        segment_ids=segment_ids,
+    )
     return loss, metrics
 
   def _compute_metrics(
@@ -332,7 +351,14 @@ class BaseTransformerModel(BaseModel):
         mask=mask,
         loss=loss,
         z_loss=z_loss,
-        segment_ids=segment_ids)
+        segment_ids=segment_ids,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class DecoderParams:
+  return_all_decodes: bool = False
+  num_decodes: int = 1
 
 
 class EncoderDecoderModel(BaseTransformerModel):
@@ -347,14 +373,21 @@ class EncoderDecoderModel(BaseTransformerModel):
       output_vocabulary: seqio.Vocabulary,
       optimizer_def: optimizers.OptimizerDefType,
       decode_fn: DecodeFnCallable = decoding.beam_search,
-      feature_converter_cls: Optional[Callable[...,
-                                               seqio.FeatureConverter]] = None,
+      feature_converter_cls: Optional[
+          Callable[..., seqio.FeatureConverter]
+      ] = None,
       label_smoothing: float = 0.0,
       z_loss: float = 0.0,
-      loss_normalizing_factor: Optional[float] = None,
+      loss_normalizing_factor: Optional[
+          Union[float, int, str, losses.SpecialLossNormalizingFactor]
+      ] = None,
+      default_decoder_params: Optional[DecoderParams] = None,
   ):
     if feature_converter_cls is not None:
-      self.FEATURE_CONVERTER_CLS = feature_converter_cls  # pylint: disable=invalid-name
+      self.FEATURE_CONVERTER_CLS = (
+          feature_converter_cls  # pylint: disable=invalid-name
+      )
+    self._default_decoder_params = default_decoder_params or DecoderParams()
     super().__init__(
         module=module,
         input_vocabulary=input_vocabulary,
@@ -370,7 +403,7 @@ class EncoderDecoderModel(BaseTransformerModel):
       self,
       rng: jax.random.KeyArray,
       input_shapes: Mapping[str, Array],
-      input_types: Optional[Mapping[str, jnp.dtype]] = None
+      input_types: Optional[Mapping[str, jnp.dtype]] = None,
   ) -> flax_scope.FrozenVariableDict:
     """Get the initial variables for an encoder-decoder model."""
     input_types = {} if input_types is None else input_types
@@ -381,38 +414,45 @@ class EncoderDecoderModel(BaseTransformerModel):
     if 'encoder_positions' in input_shapes:
       encoder_positions = jnp.ones(
           input_shapes['encoder_positions'],
-          input_types.get('encoder_positions', jnp.int32))
+          input_types.get('encoder_positions', jnp.int32),
+      )
     else:
       encoder_positions = None
     if 'decoder_positions' in input_shapes:
       decoder_positions = jnp.ones(
           input_shapes['decoder_positions'],
-          input_types.get('decoder_positions', jnp.int32))
+          input_types.get('decoder_positions', jnp.int32),
+      )
     else:
       decoder_positions = None
     if 'encoder_segment_ids' in input_shapes:
       encoder_segment_ids = jnp.ones(
           input_shapes['encoder_segment_ids'],
-          input_types.get('encoder_segment_ids', jnp.int32))
+          input_types.get('encoder_segment_ids', jnp.int32),
+      )
     else:
       encoder_segment_ids = None
     if 'decoder_segment_ids' in input_shapes:
       decoder_segment_ids = jnp.ones(
           input_shapes['decoder_segment_ids'],
-          input_types.get('decoder_segment_ids', jnp.int32))
+          input_types.get('decoder_segment_ids', jnp.int32),
+      )
     else:
       decoder_segment_ids = None
-    initial_variables = self.module.init(
-        rng,
-        jnp.ones(encoder_shape, encoder_type),
-        jnp.ones(decoder_shape, decoder_type),
-        jnp.ones(decoder_shape, decoder_type),
-        encoder_positions=encoder_positions,
-        decoder_positions=decoder_positions,
-        encoder_segment_ids=encoder_segment_ids,
-        decoder_segment_ids=decoder_segment_ids,
-        decode=False,
-        enable_dropout=False)
+    initial_variables = flax_core.freeze(
+        self.module.init(
+            rng,
+            jnp.ones(encoder_shape, encoder_type),
+            jnp.ones(decoder_shape, decoder_type),
+            jnp.ones(decoder_shape, decoder_type),
+            encoder_positions=encoder_positions,
+            decoder_positions=decoder_positions,
+            encoder_segment_ids=encoder_segment_ids,
+            decoder_segment_ids=decoder_segment_ids,
+            decode=False,
+            enable_dropout=False,
+        )
+    )
     return initial_variables
 
   def _compute_logits(  # pytype: disable=signature-mismatch  # jax-ndarray
@@ -429,10 +469,7 @@ class EncoderDecoderModel(BaseTransformerModel):
     if other_variables is None:
       other_variables = {}
     return self.module.apply(
-        {
-            'params': params,
-            **other_variables
-        },
+        {'params': params, **other_variables},
         batch['encoder_input_tokens'],
         batch['decoder_input_tokens'],
         batch['decoder_target_tokens'],
@@ -443,7 +480,8 @@ class EncoderDecoderModel(BaseTransformerModel):
         decode=False,
         enable_dropout=rngs is not None,
         rngs=rngs,
-        mutable=mutable)
+        mutable=mutable,
+    )
 
   def _compute_logits_from_slice(
       self,
@@ -462,10 +500,7 @@ class EncoderDecoderModel(BaseTransformerModel):
     # flat_cache: [batch * beam, num_heads, depth_per_head, max_decode_len]
     # flat_logits: [batch * beam, seq_len=1, vocab]
     flat_logits, new_vars = self.module.apply(
-        {
-            'params': params,
-            'cache': flat_cache
-        },
+        {'params': params, 'cache': flat_cache},
         encoded_inputs,
         raw_inputs,  # only needed for encoder padding mask
         flat_ids,
@@ -474,7 +509,8 @@ class EncoderDecoderModel(BaseTransformerModel):
         decode=True,
         max_decode_length=max_decode_length,
         mutable=['cache'],
-        method=self.module.decode)
+        method=self.module.decode,
+    )
     # Remove sequence length dimension since it's always 1 during decoding.
     flat_logits = jnp.squeeze(flat_logits, axis=1)
     new_flat_cache = new_vars['cache']
@@ -486,22 +522,25 @@ class EncoderDecoderModel(BaseTransformerModel):
       encoded_inputs: jnp.ndarray,
       encoder_input_tokens: jnp.ndarray,
       decoder_input_tokens: jnp.ndarray,
+      prefill_decoder_prompt: bool = False,
   ) -> Tuple[PyTree, Optional[jnp.ndarray]]:
-    """Initialize the key/value cache.
+    """Initialize the key/value cache, with optional prompt.
 
     Args:
       params: The parameters of the model.
-      encoded_inputs: Output of the encoder on the inputs. Unused.
+      encoded_inputs: Output of the encoder on the inputs.
       encoder_input_tokens: Input tokens for the encoder. Only needed for
         padding mask.
-      decoder_input_tokens: Input tokens for the decoder. Only needed for
-        length.
+      decoder_input_tokens: Input tokens for the decoder, possibly containing a
+        prompt.
+      prefill_decoder_prompt: Whether to prefill the cache using the decoder
+        prompt.
 
     Returns:
       cache: The initialzed cache.
-      initial_index: None, since we are not prefilling.
+      initial_index: The index of the next position following prefill or None if
+        `prefill_decoder_prompt` is False.
     """
-    del encoded_inputs
     _, initial_variables = self.module.apply(
         {'params': params},
         encoder_input_tokens=jnp.ones_like(encoder_input_tokens),
@@ -512,10 +551,37 @@ class EncoderDecoderModel(BaseTransformerModel):
         enable_dropout=False,
     )
 
-    # Our initial index is None since we do not prefill based on a prompt.
-    initial_index = None
+    cache = initial_variables['cache']
 
-    return initial_variables['cache'], initial_index
+    if not prefill_decoder_prompt:
+      return cache, None
+
+    # Prefill the cache based on an (optional) prompt.
+    # We assume the only 0 tokens are a BOS=0 token at the beginning of the
+    # input and PAD=0 tokens at the end.
+    inputs_lengths = jnp.sum(decoder_input_tokens != 0, axis=1)
+
+    _, variables_with_cache = self.module.apply(
+        {'params': params, 'cache': cache},
+        encoded=encoded_inputs,
+        encoder_input_tokens=encoder_input_tokens,  # only for padding mask,
+        decoder_input_tokens=decoder_input_tokens,
+        decoder_target_tokens=jnp.ones_like(decoder_input_tokens),  # for shape
+        mutable=['cache'],
+        enable_dropout=False,
+        prefill=True,
+        prefill_lengths=inputs_lengths,
+        method=self.module.decode,
+    )
+
+    cache = variables_with_cache['cache']
+    if 'position_embedder' in cache['decoder']:
+      # TODO(adarob): Instead have `module.decode` accept an index.
+      cache['decoder']['position_embedder'][
+          'position_embedder_index'
+      ] = inputs_lengths
+
+    return cache, inputs_lengths
 
   def predict_batch_with_aux(
       self,
@@ -523,8 +589,8 @@ class EncoderDecoderModel(BaseTransformerModel):
       batch: Mapping[str, jnp.ndarray],
       rng: Optional[jax.random.KeyArray] = None,
       decoder_params: Optional[MutableMapping[str, Any]] = None,
-      return_all_decodes: bool = False,
-      num_decodes: int = 1,
+      return_all_decodes: bool = None,
+      num_decodes: int = None,  # pytype:disable=annotation-type-mismatch
       prompt_with_targets: bool = False,
   ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
     """Predict with fast decoding beam search on a batch.
@@ -549,6 +615,7 @@ class EncoderDecoderModel(BaseTransformerModel):
     If `return_all_decodes = True`, the return tuple contains the predictions
     with a shape [batch, num_decodes, max_decode_len] and the scores (i.e., log
     probability of the generated sequence) with a shape [batch, num_decodes].
+    The beam dimension is sorted in increasing order of log-probability.
 
     If `return_all_decodes = False`, the return tuple contains the predictions
     with a shape [batch, max_decode_len] and the scores with a shape [batch].
@@ -577,26 +644,14 @@ class EncoderDecoderModel(BaseTransformerModel):
         the batch of predictions, with the entire beam if requested
         an auxiliary dictionary of decoder scores
     """
+    if return_all_decodes is None:
+      return_all_decodes = self._default_decoder_params.return_all_decodes
+    if num_decodes is None:
+      num_decodes = self._default_decoder_params.num_decodes
+
     # [batch, input_len]
     encoder_input_tokens = batch['encoder_input_tokens']
     decoder_input_tokens = batch['decoder_input_tokens']
-
-    # Prepare transformer fast-decoder call for beam search: for beam search, we
-    # need to set up our decoder model to handle a batch size equal to
-    # batch_size * num_decodes, where each batch item's data is expanded
-    # in-place rather than tiled.
-    # i.e. if we denote each batch element subtensor as el[n]:
-    # [el0, el1, el2] --> beamsize=2 --> [el0,el0,el1,el1,el2,el2]
-    # [batch * num_decodes, input_len, emb_dim]
-    encoded_inputs = decoding.flat_batch_beam_expand(
-        self.module.apply(
-            {'params': params},
-            encoder_input_tokens,
-            enable_dropout=False,
-            method=self.module.encode,
-        ),
-        num_decodes,
-    )
 
     # `decoder_prompt_inputs` is initialized from the batch's
     # `decoder_input_tokens`. The EOS is stripped to avoid decoding to stop
@@ -610,24 +665,54 @@ class EncoderDecoderModel(BaseTransformerModel):
     else:
       decoder_prompt_inputs = jnp.zeros_like(decoder_input_tokens)
 
+    encoded_inputs = self.module.apply(
+        {'params': params},
+        encoder_input_tokens,
+        enable_dropout=False,
+        method=self.module.encode,
+    )
+
     # Prepare autoregressive cache.
+    if 'initial_index' not in inspect.signature(self.decode_fn).parameters:
+      logging.info(
+          'Disabling prompt prefilliing due to incompatible decode fn: %s.',
+          self.decode_fn,
+      )
+      prefill_decoder_prompt = False
+    elif 'prefill' not in inspect.signature(self.module.decode).parameters:
+      logging.info(
+          'Disabling prompt prefilliing due to incompatible `module.decode`.'
+      )
+      prefill_decoder_prompt = False
+    else:
+      logging.info('Enabling prompt prefilling.')
+      prefill_decoder_prompt = True
     cache, initial_index = self._compute_kv_cache(
         params,
         encoded_inputs=encoded_inputs,
         encoder_input_tokens=encoder_input_tokens,
         decoder_input_tokens=decoder_prompt_inputs,
+        prefill_decoder_prompt=prefill_decoder_prompt,
     )
 
-    # [batch * num_decodes, input_len]
-    raw_inputs = decoding.flat_batch_beam_expand(
-        encoder_input_tokens, num_decodes
-    )
-
+    # Prepare transformer fast-decoder call for beam search: for beam search, we
+    # need to set up our decoder model to handle a batch size equal to
+    # batch_size * num_decodes, where each batch item's data is expanded
+    # in-place rather than tiled.
+    # i.e. if we denote each batch element subtensor as el[n]:
+    # [el0, el1, el2] --> beamsize=2 --> [el0,el0,el1,el1,el2,el2]
+    # [batch * num_decodes, input_len, emb_dim]
     tokens_ids_to_logits = functools.partial(
         self._compute_logits_from_slice,
         params=params,
-        encoded_inputs=encoded_inputs,
-        raw_inputs=raw_inputs,
+        # [batch * num_decodes, input_len, emb_dim]
+        encoded_inputs=decoding.flat_batch_beam_expand(
+            encoded_inputs, num_decodes
+        ),
+        # [batch * num_decodes, input_len]
+        raw_inputs=decoding.flat_batch_beam_expand(
+            encoder_input_tokens, num_decodes
+        ),
         max_decode_length=decoder_input_tokens.shape[1],
     )
 
@@ -641,9 +726,11 @@ class EncoderDecoderModel(BaseTransformerModel):
     if rng is not None:
       if decoder_params.get('decode_rng') is not None:
         raise ValueError(
-            f'Got RNG both from the `rng` argument ({rng}) and '
-            f"`decoder_params['decode_rng']` ({decoder_params['decode_rng']}). "
-            'Please specify one or the other.')
+            f'Got RNG both from the `rng` argument ({rng}) and'
+            " `decoder_params['decode_rng']`"
+            f' ({decoder_params["decode_rng"]}). Please specify one or the'
+            ' other.'
+        )
       decoder_params['decode_rng'] = rng
 
     # TODO(hwchung): rename the returned value names to more generic ones.
@@ -661,7 +748,8 @@ class EncoderDecoderModel(BaseTransformerModel):
         tokens_to_logits=tokens_ids_to_logits,
         num_decodes=num_decodes,
         cache_offset=1 if scanned else 0,
-        **decoder_params)
+        **decoder_params,
+    )
 
     # Beam search returns [n_batch, n_beam, n_length] with beam dimension sorted
     # in increasing order of log-probability.
@@ -683,12 +771,14 @@ class EncoderDecoderModel(BaseTransformerModel):
 
     if return_intermediates:
       logits, modified_variables = self._compute_logits(
-          params=params, batch=batch, mutable=['intermediates'])
+          params=params, batch=batch, mutable=['intermediates']
+      )
 
       # Inside self.module, we called nn.Module.sow to track various
       # intermediate values. We extract them here.
       intermediates = flax_core.unfreeze(
-          modified_variables.get('intermediates', {}))
+          modified_variables.get('intermediates', {})
+      )
 
       # Track per-token labels and loss weights as well. These are not
       # intermediate values of logit computation, so we manually add them here.
@@ -703,11 +793,18 @@ class EncoderDecoderModel(BaseTransformerModel):
 
     # Purposefully don't use config.z_loss because that term is for training
     # stability and shouldn't affect our reported scores.
-    token_scores = -losses.cross_entropy_with_logits(
-        logits,
-        common_utils.onehot(
-            target_tokens, logits.shape[-1], on_value=1, off_value=0),
-        z_loss=0.0)[0] * weights
+    token_scores = (
+        -losses.cross_entropy_with_logits(
+            logits,
+            common_utils.onehot(
+                target_tokens, logits.shape[-1], on_value=1, off_value=0
+            ),
+            z_loss=0.0,
+        )[0]
+        * weights
+    )
+    if return_intermediates:
+      intermediates['decoder']['token_scores'] = (token_scores,)
 
     sequence_scores = token_scores.sum(-1)
 
@@ -740,14 +837,19 @@ class DecoderOnlyModel(BaseTransformerModel):
       optimizer_def: optimizers.OptimizerDefType,
       decode_fn: DecodeFnCallable = decoding.temperature_sample,
       inputs_bidirectional_attention: bool = False,
-      feature_converter_cls: Optional[Callable[...,
-                                               seqio.FeatureConverter]] = None,
+      feature_converter_cls: Optional[
+          Callable[..., seqio.FeatureConverter]
+      ] = None,
       label_smoothing: float = 0.0,
       z_loss: float = 0.0,
-      loss_normalizing_factor: Optional[float] = None,
+      loss_normalizing_factor: Optional[
+          Union[float, int, str, losses.SpecialLossNormalizingFactor]
+      ] = None,
   ):
     if feature_converter_cls is not None:
-      self.FEATURE_CONVERTER_CLS = feature_converter_cls  # pylint: disable=invalid-name
+      self.FEATURE_CONVERTER_CLS = (
+          feature_converter_cls  # pylint: disable=invalid-name
+      )
     self._inputs_bidirectional_attention = inputs_bidirectional_attention
     super().__init__(
         module,
@@ -764,7 +866,7 @@ class DecoderOnlyModel(BaseTransformerModel):
       self,
       rng: jax.random.KeyArray,
       input_shapes: Mapping[str, Array],
-      input_types: Optional[Mapping[str, jnp.dtype]] = None
+      input_types: Optional[Mapping[str, jnp.dtype]] = None,
   ) -> flax_scope.FrozenVariableDict:
     """Get the initial variables."""
     input_types = {} if input_types is None else input_types
@@ -774,15 +876,18 @@ class DecoderOnlyModel(BaseTransformerModel):
         rng,
         jnp.ones(decoder_shape, decoder_type),
         jnp.ones(decoder_shape, decoder_type),
-        enable_dropout=False)
-    return initial_variables
+        enable_dropout=False,
+    )
+    return flax_core.freeze(initial_variables)
 
   def _get_decoder_causal_attention(self, batch):
     """Returns decoder causal attention from the batch or None."""
     if self._inputs_bidirectional_attention:
       if 'decoder_causal_attention' not in batch:
-        raise ValueError('`inputs_bidirectional_attention` mode requires '
-                         '"decoder_causal_attention" feature in the batch')
+        raise ValueError(
+            '`inputs_bidirectional_attention` mode requires '
+            '"decoder_causal_attention" feature in the batch'
+        )
       decoder_causal_attention = batch['decoder_causal_attention']
     else:
       decoder_causal_attention = None
@@ -804,10 +909,7 @@ class DecoderOnlyModel(BaseTransformerModel):
       other_variables = {}
 
     return self.module.apply(
-        {
-            'params': params,
-            **other_variables
-        },
+        {'params': params, **other_variables},
         batch['decoder_input_tokens'],
         batch['decoder_target_tokens'],
         decoder_segment_ids=batch.get('decoder_segment_ids', None),
@@ -816,7 +918,8 @@ class DecoderOnlyModel(BaseTransformerModel):
         rngs=rngs,
         decode=False,
         enable_dropout=rngs is not None,
-        mutable=mutable)
+        mutable=mutable,
+    )
 
   def _compute_logits_from_slice(
       self,
@@ -833,16 +936,14 @@ class DecoderOnlyModel(BaseTransformerModel):
     # flat_cache['cache_index']: [batch]
     # flat_logits: [batch, seq_len=1, vocab]
     flat_logits, new_vars = self.module.apply(
-        {
-            'params': params,
-            'cache': flat_cache
-        },
+        {'params': params, 'cache': flat_cache},
         flat_ids,
         flat_ids,
         enable_dropout=False,
         decode=True,
         max_decode_length=max_decode_length,
-        mutable=['cache'])
+        mutable=['cache'],
+    )
     # Remove sequence length dimension since it's always 1 during decoding.
     flat_logits = jnp.squeeze(flat_logits, axis=1)
     new_flat_cache = new_vars['cache']
@@ -864,12 +965,14 @@ class DecoderOnlyModel(BaseTransformerModel):
           params=params,
           batch=batch,
           dropout_rng=None,
-          mutable=['intermediates'])
+          mutable=['intermediates'],
+      )
 
       # Inside self.module, we called nn.Module.sow to track various
       # intermediate values. We extract them here.
       intermediates = flax_core.unfreeze(
-          modified_variables.get('intermediates', {}))
+          modified_variables.get('intermediates', {})
+      )
 
       # Track per-token labels and loss weights as well. These are not
       # intermediate values of logit computation, so we manually add them here.
@@ -881,13 +984,22 @@ class DecoderOnlyModel(BaseTransformerModel):
       # These values each have just one instantiation, hence singletons.
     else:
       logits = self._compute_logits(
-          params=params, batch=batch, dropout_rng=None)
+          params=params, batch=batch, dropout_rng=None
+      )
 
-    token_scores = -losses.cross_entropy_with_logits(
-        logits,
-        common_utils.onehot(
-            decoder_target_tokens, logits.shape[-1], on_value=1, off_value=0),
-        z_loss=0.0)[0] * weights
+    token_scores = (
+        -losses.cross_entropy_with_logits(
+            logits,
+            common_utils.onehot(
+                decoder_target_tokens, logits.shape[-1], on_value=1, off_value=0
+            ),
+            z_loss=0.0,
+        )[0]
+        * weights
+    )
+    if return_intermediates:
+      intermediates['decoder']['token_scores'] = (token_scores,)
+
     sequence_scores = token_scores.sum(-1)
 
     if return_intermediates:
@@ -917,19 +1029,23 @@ class DecoderOnlyModel(BaseTransformerModel):
     # excluding the initial BOS.
     inputs_lengths = jnp.sum(inputs[:, 1:] != 0, axis=-1)
 
-    _, initial_variables = self.module.apply({'params': params},
-                                             jnp.ones_like(inputs),
-                                             jnp.ones_like(inputs),
-                                             enable_dropout=False,
-                                             decode=True,
-                                             mutable=['cache'])
+    _, initial_variables = self.module.apply(
+        {'params': params},
+        jnp.ones_like(inputs),
+        jnp.ones_like(inputs),
+        enable_dropout=False,
+        decode=True,
+        mutable=['cache'],
+    )
     cache = initial_variables['cache']
     if 'cache_axes' in initial_variables:
       cache_axes = initial_variables['cache_axes']
 
       cache = jax.tree_util.tree_map(
-          flax_partitioning.with_sharding_constraint, cache,
-          flax_partitioning.get_axis_names(cache_axes))
+          flax_partitioning.with_sharding_constraint,
+          cache,
+          flax_partitioning.get_axis_names(cache_axes),
+      )
 
     # Prefill our cache with all the inputs. `inputs_lengths` is the index of
     # the last input token. The cache will be filled for all the input
@@ -1055,8 +1171,9 @@ class DecoderOnlyModel(BaseTransformerModel):
         'decode_rng' to the decoding function.
       return_all_decodes: if True, will return all batch_size * num_decodes
         samples from the model as an array of shape [batch_size, num_decodes,
-        sequence_length]. Otherwise returns only the most likely samples as an
-        array of shape [batch_size, sequence_length].
+        sequence_length]. In this case the `num_decodes` dimension is sorted in
+        increasing order of log-probability. Otherwise returns only the most
+        likely samples as an array of shape [batch_size, sequence_length].
       num_decodes: number of decoded sequences to be returned.
       decoder_params: additional (model-independent) parameters for the decoder.
 
@@ -1085,16 +1202,19 @@ class DecoderOnlyModel(BaseTransformerModel):
     tokens_ids_to_logits = functools.partial(
         self._compute_logits_from_slice,
         params=params,
-        max_decode_length=max_decode_length)
+        max_decode_length=max_decode_length,
+    )
 
     if decoder_params is None:
       decoder_params = {}
     if rng is not None:
       if decoder_params.get('decode_rng') is not None:
         raise ValueError(
-            f'Got RNG both from the `rng` argument ({rng}) and '
-            f"`decoder_params['decode_rng']` ({decoder_params['decode_rng']}). "
-            'Please specify one or the other.')
+            f'Got RNG both from the `rng` argument ({rng}) and'
+            " `decoder_params['decode_rng']`"
+            f' ({decoder_params["decode_rng"]}). Please specify one or the'
+            ' other.'
+        )
       decoder_params['decode_rng'] = rng
 
     # Using the above-defined single-step decoder function, run temperature
@@ -1130,8 +1250,9 @@ class DecoderOnlyModel(BaseTransformerModel):
 
 
 @jax.vmap
-def remove_prefix(sequence: jnp.ndarray,
-                  prefix_length: jnp.ndarray) -> jnp.ndarray:
+def remove_prefix(
+    sequence: jnp.ndarray, prefix_length: jnp.ndarray
+) -> jnp.ndarray:
   """Remove the prefix portion and shift to the left by the prefix length.
 
   The example below uses non-decorated function definition, i.e., arrays do not
@@ -1156,7 +1277,7 @@ def remove_prefix(sequence: jnp.ndarray,
   """
   length = sequence.shape[-1]
   # A binary mask with 1 at inputs.
-  inputs_mask = (jnp.arange(length) < prefix_length)
+  inputs_mask = jnp.arange(length) < prefix_length
   # A binary mask with 1 at the targets and padding positions.
   targets_and_padding_mask = jnp.logical_not(inputs_mask).astype(sequence.dtype)
   # Since padding id = 0, the padding mask is zeroed out.
@@ -1170,7 +1291,8 @@ def remove_prefix(sequence: jnp.ndarray,
 def compute_weighted_accuracy(
     logits: jnp.ndarray,
     targets: jnp.ndarray,
-    weights: Optional[jnp.ndarray] = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    weights: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Compute weighted accuracy for log probs and targets.
 
   Args:
@@ -1182,8 +1304,10 @@ def compute_weighted_accuracy(
     Scalar accuracy.
   """
   if logits.ndim != targets.ndim + 1:
-    raise ValueError('Incorrect shapes. Got shape %s logits and %s targets' %
-                     (str(logits.shape), str(targets.shape)))
+    raise ValueError(
+        'Incorrect shapes. Got shape %s logits and %s targets'
+        % (str(logits.shape), str(targets.shape))
+    )
   accuracy = jnp.equal(jnp.argmax(logits, axis=-1), targets)
   if weights is not None:
     accuracy = accuracy * weights
@@ -1192,10 +1316,14 @@ def compute_weighted_accuracy(
 
 
 # TODO(cpgaffney) remove when users rely on compute_base_metrics
-def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray,
-                    weights: jnp.ndarray, loss: jnp.ndarray,
-                    weight_sum: jnp.ndarray,
-                    additional_metrics: MetricsMap) -> MetricsMap:
+def compute_metrics(
+    logits: jnp.ndarray,
+    targets: jnp.ndarray,
+    weights: jnp.ndarray,
+    loss: jnp.ndarray,
+    weight_sum: jnp.ndarray,
+    additional_metrics: MetricsMap,
+) -> MetricsMap:
   """Compute summary metrics."""
   accuracy = compute_weighted_accuracy(logits, targets, weights)
   metrics = {
@@ -1203,7 +1331,7 @@ def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray,
       'accuracy': accuracy,
       'weight_sum': weight_sum,
       'num_examples': targets.shape[0],
-      'num_tokens': targets.size
+      'num_tokens': targets.size,
   }
   metrics = metrics_lib.create_metrics_dict(metrics)
   metrics.update(additional_metrics)
@@ -1263,11 +1391,12 @@ def compute_base_metrics(
    z_loss: z_loss (float)
    segment_ids: Optional dictionary of feature and value is the segment ids used
      for packing, i.e. [batch, length] arrays.
+
   Returns:
     Dict of metrics.
   """
-  num_examples = targets.shape[0]
-  num_tokens = targets.size
+  num_examples = jnp.array(targets.shape[0])
+  num_tokens = jnp.array(targets.size)
   num_devices = jax.device_count()
   assert num_devices, 'JAX is reporting no devices, but it should.'
   # Note: apply mask again even though mask has already been applied to loss.
@@ -1275,65 +1404,71 @@ def compute_base_metrics(
   # the numerator.
   nonpadding_tokens = jnp.sum(mask) if mask is not None else targets.size
   metrics = {
-      'accuracy':
-          clu_metrics.Accuracy.from_model_output(
-              logits=logits, labels=targets.astype(jnp.int32), mask=mask),
-      'loss':
-          metrics_lib.AveragePerStep(total=loss),
-      'loss_per_nonpadding_target_token':
-          clu_metrics.Average(total=loss, count=nonpadding_tokens),
-      'loss_per_all_target_tokens':
-          clu_metrics.Average(total=loss, count=num_tokens),
-      'timing/seqs_per_second':
-          metrics_lib.TimeRate.from_model_output(numerator=num_examples),
-      'timing/steps_per_second':
-          metrics_lib.StepsPerTime.from_model_output(),
-      'timing/seconds':
-          metrics_lib.Time(),
-      'timing/seqs':
-          metrics_lib.Sum(num_examples),
-      'timing/seqs_per_second_per_core':
-          metrics_lib.TimeRate.from_model_output(numerator=num_examples /
-                                                 num_devices),
-      'timing/target_tokens_per_second':
-          metrics_lib.TimeRate.from_model_output(numerator=num_tokens),
-      'timing/target_tokens_per_second_per_core':
-          metrics_lib.TimeRate.from_model_output(numerator=num_tokens /
-                                                 num_devices),
-      'non_padding_fraction/loss_weights':
-          clu_metrics.Average(total=nonpadding_tokens, count=num_tokens),
+      'accuracy': clu_metrics.Accuracy.from_model_output(
+          logits=logits, labels=targets.astype(jnp.int32), mask=mask
+      ),
+      'loss': metrics_lib.AveragePerStep(total=loss),
+      'loss_per_nonpadding_target_token': clu_metrics.Average(
+          total=loss, count=nonpadding_tokens
+      ),
+      'loss_per_all_target_tokens': clu_metrics.Average(
+          total=loss, count=num_tokens
+      ),
+      'timing/seqs_per_second': metrics_lib.TimeRate.from_model_output(
+          numerator=num_examples
+      ),
+      'timing/steps_per_second': metrics_lib.StepsPerTime.from_model_output(),
+      'timing/seconds': metrics_lib.Time(),
+      'timing/seqs': metrics_lib.Sum(num_examples),
+      'timing/seqs_per_second_per_core': metrics_lib.TimeRate.from_model_output(
+          numerator=num_examples / num_devices
+      ),
+      'timing/target_tokens_per_second': metrics_lib.TimeRate.from_model_output(
+          numerator=num_tokens
+      ),
+      'timing/target_tokens_per_second_per_core': (
+          metrics_lib.TimeRate.from_model_output(
+              numerator=num_tokens / num_devices
+          )
+      ),
+      'non_padding_fraction/loss_weights': clu_metrics.Average(
+          total=nonpadding_tokens, count=num_tokens
+      ),
   }
   if z_loss is not None:
     metrics.update({
-        'z_loss':
-            metrics_lib.AveragePerStep(total=z_loss),
-        'z_loss_per_all_target_tokens':
-            clu_metrics.Average(total=z_loss, count=num_tokens),
-        'cross_ent_loss':
-            metrics_lib.AveragePerStep(total=loss - z_loss),
-        'cross_ent_loss_per_all_target_tokens':
-            clu_metrics.Average(total=jnp.sum(loss - z_loss), count=num_tokens)
+        'z_loss': metrics_lib.AveragePerStep(total=z_loss),
+        'z_loss_per_all_target_tokens': clu_metrics.Average(
+            total=z_loss, count=num_tokens
+        ),
+        'cross_ent_loss': metrics_lib.AveragePerStep(total=loss - z_loss),
+        'cross_ent_loss_per_all_target_tokens': clu_metrics.Average(
+            total=jnp.sum(loss - z_loss), count=num_tokens
+        ),
     })
 
   if segment_ids is not None:
-    total_tokens = 0
-    total_non_padding_tokens = 0
+    total_tokens = jnp.array(0)
+    total_non_padding_tokens = jnp.array(0)
     for feature, feature_segment_ids in segment_ids.items():
       if feature_segment_ids is None or feature_segment_ids.shape[1] == 0:
         continue
       # Since this is [B, L] with the segment ids in axis = 1.
       num_examples = count_packed_examples(feature_segment_ids)
       metrics[f'effective_batch_size/{feature}'] = metrics_lib.AveragePerStep(
-          total=num_examples)
+          total=num_examples
+      )
       # 0s is padding
       feature_non_padding = jnp.sum(feature_segment_ids != 0)
-      feature_size = feature_segment_ids.size
+      feature_size = jnp.array(feature_segment_ids.size)
       total_tokens += feature_size
       total_non_padding_tokens += feature_non_padding
       metrics[f'non_padding_fraction/{feature}'] = clu_metrics.Average(
-          total=feature_non_padding, count=feature_size)
+          total=feature_non_padding, count=feature_size
+      )
     metrics['non_padding_fraction/overall'] = clu_metrics.Average(
-        total=total_non_padding_tokens, count=total_tokens)
+        total=total_non_padding_tokens, count=total_tokens
+    )
 
   return metrics
 

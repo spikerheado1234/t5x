@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import math
 import os
 import time
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
-import warnings
 
 # Set Linen to add profiling information when constructing Modules.
 # Must be set before flax imports.
@@ -32,8 +31,6 @@ os.environ['FLAX_PROFILE'] = 'true'
 os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
 from clu import metric_writers
-import fiddle as fdl
-from fiddle import absl_flags
 import jax
 from jax import random
 from jax.experimental import multihost_utils
@@ -121,8 +118,6 @@ def train(
     train_state_initializer_cls: Type[
         utils.TrainStateInitializer
     ] = utils.TrainStateInitializer,
-    use_gda: bool = True,
-    use_jax_array: bool = True,
     use_orbax: bool = False,
     verify_matching_vocabs_fn: Optional[
         Callable[[utils.DatasetConfig, models.BaseTransformerModel], None]
@@ -183,10 +178,6 @@ def train(
       eval metrics before training begins.
     train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
       initializing partitioned TrainState from checkpoints or scratch.
-    use_gda: if True, uses jax.Array. Experimental feature.
-    use_jax_array: if True, uses jax.Array if use_gda is also True. Experimental
-      feature. Since GlobalDeviceArray is deprecated, this is ignored, as
-      jax.Array must always be used.
     use_orbax: if True, uses Orbax for checkpointing. Experimental feature.
     verify_matching_vocabs_fn: Function to validate whether the task vocabulary
       matches the model vocabulary. Should raise an exception on error.
@@ -200,22 +191,8 @@ def train(
   logging.info('Process ID: %d', jax.process_index())
   tf.io.gfile.makedirs(model_dir)
 
-  if use_gda:
-    logging.info('jax.Array enabled.')
-  else:
-    warnings.warn(
-        '`use_gda=False` is deprecated and will be removed on Feb-01-23.'
-        ' Please ensure that your workflow can use GDA.', DeprecationWarning)
-  if use_jax_array and not use_gda:
-    raise ValueError('Invalid configuration of `use_gda` and `use_jax_array`.')
-  if use_gda:
-    if use_jax_array:
-      jax.config.update('jax_array', True)
-
   if use_orbax:
     logging.info('Checkpointing with Orbax enabled.')
-    if not use_gda:
-      raise ValueError('Must set of `use_gda` if `use_orbax` is enabled.')
     if (
         checkpoint_cfg.save
         and isinstance(
@@ -227,11 +204,10 @@ def train(
             checkpoint_cfg.restore.checkpointer_cls, pw_checkpoints.Checkpointer
         )
     ):
-      warnings.warn(
+      raise ValueError(
           'Requested use_orbax with Pathways checkpointing, which is currently'
-          ' unsupported. Setting use_orbax=False.'
+          ' unsupported.'
       )
-      use_orbax = False
 
   # Each "epoch" of the training loop should be the min of the eval period,
   # checkpoint period or the full training.
@@ -240,6 +216,10 @@ def train(
   eval_enabled = (train_eval_dataset_cfg or infer_eval_dataset_cfg)
   eval_period = eval_period if eval_enabled else 0
   checkpoint_period = checkpoint_cfg.save.period if checkpoint_cfg.save else 0
+  checkpoint_steps = (
+      checkpoint_cfg.save.checkpoint_steps if checkpoint_cfg.save else []
+  )
+
   if eval_period or checkpoint_period or gc_period:
     steps_per_epoch = min(eval_period or np.inf, checkpoint_period or np.inf,
                           gc_period or np.inf)
@@ -303,7 +283,6 @@ def train(
   train_iter = utils.prepare_train_iter(
       train_iter,
       checkpoint_cfg=checkpoint_cfg,
-      use_gda=use_gda,
       partitioner=partitioner,
       data_layout=data_layout)
 
@@ -375,41 +354,28 @@ def train(
       partitioner=partitioner)
 
   # May be None, empty
-  valid_restore_cfg, restore_paths = utils.get_first_valid_restore_config_and_paths(
-      restore_cfgs)
+  valid_restore_cfg, restore_paths = (
+      utils.get_first_valid_restore_config_and_paths(restore_cfgs)
+  )
   if len(restore_paths) > 1:
     raise ValueError('Multiple restore paths not permitted in training.')
 
-  def _init(rng):
-    return train_state_initializer.from_scratch(rng).state_dict()
-
   # Skip initialization if neither save nor restore is requested.
   train_state = None
-  if valid_restore_cfg or checkpoint_period:
-    if use_orbax:
-      checkpoint_manager = utils.create_checkpoint_manager(
-          save_cfg=checkpoint_cfg.save,
-          restore_cfg=valid_restore_cfg,
-          train_state=train_state_initializer.global_train_state_shape,
-          partitioner=partitioner,
-          ds_iter=train_iter,
-          model_dir=model_dir,
-      )
-      train_state = utils.restore(
-          checkpoint_manager, restore_paths, valid_restore_cfg,
-          utils.get_fallback_state(valid_restore_cfg, _init, init_rng))
-    else:
-      checkpoint_manager = utils.LegacyCheckpointManager(
-          save_cfg=checkpoint_cfg.save,
-          restore_cfg=valid_restore_cfg,
-          train_state_shape=train_state_initializer.global_train_state_shape,
-          partitioner=partitioner,
-          ds_iter=train_iter,
-          model_dir=model_dir,
-          use_gda=use_gda)
-      train_state = checkpoint_manager.restore(
-          restore_paths, valid_restore_cfg,
-          utils.get_fallback_state(valid_restore_cfg, _init, init_rng))
+  if valid_restore_cfg or checkpoint_period or checkpoint_steps:
+    train_state, checkpoint_manager = (
+        utils.create_checkpoint_manager_and_restore(
+            train_state_initializer,
+            partitioner,
+            valid_restore_cfg,
+            restore_paths[0] if restore_paths else None,
+            init_rng,
+            save_checkpoint_cfg=checkpoint_cfg.save,
+            model_dir=model_dir,
+            ds_iter=train_iter,
+            use_orbax=use_orbax,
+        )
+    )
 
   # Start warming up the input pipeline in the background. This must happen
   # after input pipeline checkpoints were restored.
@@ -548,7 +514,7 @@ def train(
       logging.info('Saving checkpoint before the training loop starts.')
       checkpoint_manager.save(
           trainer.train_state,
-          checkpoint_cfg.save.state_transformation_fns,
+          checkpoint_cfg.save.state_transformation_fns,  # pytype: disable=attribute-error
       )
 
   # If we take manual control of the garbage collector, we need to disable it
@@ -606,11 +572,7 @@ def train(
     )
 
   # Construct dummy batch for compiling the model.
-  if use_gda:
-    dummy_batch = jax.tree_map(_as_gda, train_iter.element_spec)
-  else:
-    dummy_batch = jax.tree_map(lambda x: np.ones(x.shape, x.dtype),
-                               train_iter.element_spec)
+  dummy_batch = jax.tree_map(_as_gda, train_iter.element_spec)
   if not isinstance(dummy_batch, Mapping):
     raise ValueError('Training loop expects batches to have type '
                      f'Mapping[str, np.ndarray] but got {type(dummy_batch)}.')
@@ -635,6 +597,10 @@ def train(
       '/jax/t5x/train/time_before_first_step_secs',
       time.time() - _IMPORT_TIME)
 
+  # Current index within checkpoint_steps list for faster lookup runtime and
+  # for creating a checkpoint if needed between stats_period iterations.
+  checkpoint_steps_index = 0
+
   # Main Loop over "epochs".
   for epoch in range(first_epoch, num_epochs):
     final_epoch = epoch == num_epochs - 1
@@ -656,24 +622,61 @@ def train(
             logging.info('Saving a checkpoint before early stopping...')
             checkpoint_manager.save(
                 trainer.train_state,
-                checkpoint_cfg.save.state_transformation_fns,
+                checkpoint_cfg.save.state_transformation_fns,  # pytype: disable=attribute-error
             )
           logging.info('Stopping training loop early since `stop_training` is '
                        'requested.')
           break
-
         inner_num_steps = min(epoch_end_step - host_step, stats_period)
+
+        # first index in checkpoint_steps list will not always be 0 (in cases
+        # where first_step is non-zero, for example), so we must iterate to the
+        # first un-trained step in checkpoint_steps list to not re-train /
+        # save old steps
+        checkpoint_steps_index = utils.find_first_checkpoint_step(
+            checkpoint_steps_index, checkpoint_steps, first_step, host_step
+        )
+        # check if inner_num_steps will skip a checkpoint_step that must be
+        # saved, if so, then iterate only to that step and save a checkpoint
+        # at that step and then continue with further iterations
+        is_checkpoint_step = False
+        (inner_num_steps, is_checkpoint_step) = utils.find_next_checkpoint_step(
+            checkpoint_steps_index,
+            inner_num_steps,
+            is_checkpoint_step,
+            host_step,
+            checkpoint_steps,
+            epoch_end_step,
+            checkpoint_period,
+            first_step,
+        )
+
         train_summary = trainer.train(
-            train_iter, inner_num_steps, start_step=host_step)
+            train_iter, inner_num_steps, start_step=host_step
+        )
         if not concurrent_metrics:
           # Note that we always pass the dictionary of `tasks` -> summary so
-          # that the actions can be performed without special casing. The only
-          # caveat is that train would need its own special `key` given no
-          # `task` will be applied.
+          # that the actions can be performed without special casing. The
+          # only caveat is that train would need its own special `key`
+          # given no `task` will be applied.
           trainer.stop_training = run_actions(  # pytype: disable=wrong-arg-types  # jax-ndarray
-              trainer_lib.ActionMode.TRAIN, actions, trainer.train_state,
-              {TRAIN_METRIC_KEY: train_summary.result()})
+              trainer_lib.ActionMode.TRAIN,
+              actions,
+              trainer.train_state,
+              {TRAIN_METRIC_KEY: train_summary.result()},
+          )
 
+        if is_checkpoint_step:
+          logging.info('Saving a checkpoint at specified checkpoint step')
+          checkpoint_manager.save(
+              trainer.train_state,
+              checkpoint_cfg.save.state_transformation_fns,  # pytype: disable=attribute-error
+          )
+        if (
+            checkpoint_steps
+            and checkpoint_steps_index < len(checkpoint_steps) - 1
+        ):
+          checkpoint_steps_index += 1
         host_step += inner_num_steps
       logging.info('END Train loop.')
     except trainer_lib.PreemptionError as e:
@@ -681,7 +684,7 @@ def train(
         logging.info('Saving emergency checkpoint.')
         checkpoint_manager.save(
             trainer.train_state,
-            checkpoint_cfg.save.state_transformation_fns,
+            checkpoint_cfg.save.state_transformation_fns,  # pytype: disable=attribute-error
         )
         logging.info('Saving emergency checkpoint done.')
       raise e
@@ -691,16 +694,17 @@ def train(
     if gc_period and (final_epoch or step_offset % gc_period == 0):
       gc.collect()
 
-    # Maybe save a checkpoint.
-    if checkpoint_period and (final_epoch or
-                              step_offset % checkpoint_period == 0):
-      # Make sure last train step has completed before starting the clock.
+    # Maybe save a checkpoint if step is at period.
+    if checkpoint_period and (
+        final_epoch or step_offset % checkpoint_period == 0
+    ):
       train_summary.result()
       logging.info('Saving checkpoint.')
       checkpoint_tick = time.time()
+      # Make sure last train step has completed before starting the clock.
       checkpoint_manager.save(
           trainer.train_state,
-          checkpoint_cfg.save.state_transformation_fns,
+          checkpoint_cfg.save.state_transformation_fns,  # pytype: disable=attribute-error
       )
       checkpoint_tock = time.time()
       train_metrics.write_scalar('timing/checkpoint_seconds',
@@ -734,13 +738,13 @@ if __name__ == '__main__':
   # pylint: disable=g-import-not-at-top
   from absl import app
   from absl import flags
+  import fiddle as fdl
   import gin
+  from t5x import config_utils
   from t5x import gin_utils
   # pylint: enable=g-import-not-at-top
 
   FLAGS = flags.FLAGS
-
-  jax.config.parse_flags_with_absl()
 
   flags.DEFINE_multi_string(
       'gin_file',
@@ -786,6 +790,14 @@ if __name__ == '__main__':
       'process_count', None, help='Number of processes for multi-host GPU.')
 
   flags.DEFINE_integer('process_index', None, help='Index of this process.')
+  flags.DEFINE_integer(
+      'initialization_timeout',
+      None,
+      help=(
+          'Timeout for jax.distributed.initialize. Default used is the '
+          'default as specified in jax.distributed.initialize. '
+      ),
+  )
 
 
   def main(argv: Sequence[str]):
@@ -803,29 +815,44 @@ if __name__ == '__main__':
     tf.config.experimental.set_visible_devices([], 'GPU')
 
 
-    if FLAGS.fdl_config_file and FLAGS.gin_file:
-      raise ValueError(
-          'Must pass only one of `--fdl_config_file` or `--gin_file`. Got: '
-          f'--fdl_config_file={FLAGS.fdl_config_file} '
-          f'--gin_file={FLAGS.gin_file}.'
-      )
-
     if FLAGS.multiprocess_gpu:
       logging.info(
           'Initializing distributed system for multi-host GPU:\n'
           '  coordinator_address: %s\n  process_count: %s\n  process_index: %s',
-          FLAGS.coordinator_address, FLAGS.process_count, FLAGS.process_index)
+          FLAGS.coordinator_address,
+          FLAGS.process_count,
+          FLAGS.process_index,
+      )
 
-      jax.distributed.initialize(FLAGS.coordinator_address, FLAGS.process_count,
-                                 FLAGS.process_index)
+      if FLAGS.initialization_timeout:
+        if jax.__version__ < '0.4.15':
+          raise ValueError(
+              'Specified'
+              f' --initialization_timeout={FLAGS.initialization_timeout}, but'
+              ' jax=={jax.__version__} does not support this yet. Use'
+              ' jax>=0.4.15'
+          )
+        jax.distributed.initialize(
+            FLAGS.coordinator_address,
+            FLAGS.process_count,
+            FLAGS.process_index,
+            initialization_timeout=FLAGS.initialization_timeout,
+        )
+      else:
+        jax.distributed.initialize(
+            FLAGS.coordinator_address, FLAGS.process_count, FLAGS.process_index
+        )
 
     if FLAGS.tfds_data_dir:
       seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
 
     seqio.add_global_cache_dirs(FLAGS.seqio_additional_cache_dirs)
 
-    if FLAGS.fdl_config_file:
-      raise NotImplementedError('Fiddle support is not implemented yet')
+
+    if config_utils.using_fdl():
+      config = config_utils.config_with_fiddle(train)
+      train_using_fiddle = fdl.build(config)
+      train_using_fiddle()
     else:
       # Create gin-configurable version of `train`.
       train_using_gin = gin.configurable(train)
@@ -837,12 +864,8 @@ if __name__ == '__main__':
           FLAGS.gin_bindings,
       )
       train_using_gin()
+
     jax.effects_barrier()
 
 
-  if FLAGS.fdl_config_file:
-    logging.info('Training using Fiddle.')
-    app.run(main, flags_parser=absl_flags.flags_parser)
-  else:
-    logging.info('Training using gin.')
-    gin_utils.run(main)
+  config_utils.run(main)

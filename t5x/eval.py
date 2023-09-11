@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ r"""Runs training- and inference-evaluation on a T5X-compatible model.
 """
 # pyformat: enable
 # pylint:enable=line-too-long
-
 import functools
 import os
 import re
@@ -175,7 +174,7 @@ class InferenceEvaluator:
 def _sorted_ckpt_paths(ckpt_paths: Collection[str]) -> Sequence[str]:
   def _extract_ckpt_step(ckpt_path: str) -> int:
     # Steps may be prefixed with "checkpoint_", "model.ckpt-" or nothing.
-    match = re.search(r'(checkpoint_|model.ckpt-)?(\d+)', ckpt_path)
+    match = re.search(r'(checkpoint_|model.ckpt-)?(\d+)\/?$', ckpt_path)
     if match is None:
       raise ValueError(f'Invalid checkpoint path: {ckpt_path}')
     assert match is not None
@@ -208,6 +207,7 @@ def evaluate(
     ] = utils.TrainStateInitializer,
     train_eval_get_dataset_fn: utils.GetEvalDatasetCallable = utils.get_training_eval_datasets,
     fallback_init_rng: Optional[int] = None,
+    use_orbax: bool = False,
 ):
   """Evaluation function.
 
@@ -234,6 +234,7 @@ def evaluate(
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
       loading and having fallback_to_scratch enabled will result in an error.
+    use_orbax: if True, uses Orbax for checkpointing. Experimental feature.
   """
   jax.monitoring.record_event('/jax/t5x/evaluate/beacon')
   logging.info('Process ID: %d', jax.process_index())
@@ -341,8 +342,20 @@ def evaluate(
 
   if fallback_init_rng is not None:
     fallback_init_rng = jax.random.PRNGKey(fallback_init_rng)
-  for train_state, ckpt_path in train_state_initializer.from_checkpoints(
-      [restore_checkpoint_cfg], init_rng=fallback_init_rng):
+  restore_cfg, ckpt_paths = utils.get_first_valid_restore_config_and_paths(
+      [restore_checkpoint_cfg]
+  )
+  for ckpt_path in ckpt_paths:
+    train_state, _ = utils.create_checkpoint_manager_and_restore(
+        train_state_initializer,
+        partitioner,
+        restore_cfg,
+        ckpt_path,
+        fallback_init_rng,
+        use_orbax=use_orbax,
+    )
+    if train_state is None:
+      raise ValueError('Failed to restore checkpoint.')
 
     # ----------------------------------------------------------------------------
     # Main evaluation loop
@@ -369,12 +382,11 @@ if __name__ == '__main__':
   # pylint:disable=g-import-not-at-top
   from absl import app
   from absl import flags
+  import fiddle as fdl
   import gin
-  # pylint:enable=g-import-not-at-top
+  from t5x import config_utils
 
   FLAGS = flags.FLAGS
-
-  jax.config.parse_flags_with_absl()
 
   flags.DEFINE_multi_string(
       'gin_file',
@@ -414,14 +426,20 @@ if __name__ == '__main__':
     if FLAGS.tfds_data_dir:
       seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
 
-    # Create gin-configurable version of `eval`.
-    evaluate_using_gin = gin.configurable(evaluate)
+    if config_utils.using_fdl():
+      config = config_utils.config_with_fiddle(evaluate)
+      evaluate_using_fiddle = fdl.build(config)
+      evaluate_using_fiddle()
+    else:
+      # Create gin-configurable version of `eval`.
+      evaluate_using_gin = gin.configurable(evaluate)
 
-    gin_utils.parse_gin_flags(
-        # User-provided gin paths take precedence if relative paths conflict.
-        FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
-        FLAGS.gin_file,
-        FLAGS.gin_bindings)
-    evaluate_using_gin()
+      gin_utils.parse_gin_flags(
+          # User-provided gin paths take precedence if relative paths conflict.
+          FLAGS.gin_search_paths + _DEFAULT_GIN_SEARCH_PATHS,
+          FLAGS.gin_file,
+          FLAGS.gin_bindings,
+      )
+      evaluate_using_gin()
 
-  gin_utils.run(main)
+  config_utils.run(main)

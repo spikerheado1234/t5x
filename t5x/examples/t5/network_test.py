@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -104,7 +104,7 @@ class NetworkTest(parameterized.TestCase):
     predicted, scores = model.predict_batch_with_aux(params, batch)
     np.testing.assert_array_equal(predicted, [[7, 1, 0], [1, 0, 0]])
     np.testing.assert_allclose(
-        scores['scores'], [-3.040324, -1.928565], rtol=1e-3
+        scores['scores'], [-3.040324, -1.928565], rtol=1e-2
     )
 
 

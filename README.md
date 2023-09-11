@@ -1,5 +1,7 @@
 # T5X
 
+*Go to [T5X ReadTheDocs Documentation Page](https://t5x.readthedocs.io/).*
+
 T5X is a modular, composable, research-friendly framework for high-performance,
 configurable, self-service training, evaluation, and inference of sequence
 models (starting with language) at many scales.
@@ -68,6 +70,7 @@ Check `gs://$GOOGLE_CLOUD_BUCKET_NAME/t5x/` for the output artifacts, which can
 be read by TensorBoard.
 
 ## GPU Usage
+UPDATE!: Nvidia has released an updated version of this repository with H100 FP8 support and broad GPU performance improvements here: [NVIDIA Rosetta](https://github.com/NVIDIA/JAX-Toolbox/tree/main/rosetta/rosetta/projects/t5x)
 
 T5X can be run easily on GPUs either in single-node configurations or multi-node configurations with a SLURM+pyxis cluster. Further instructions at [t5x/contrib/gpu/scripts_gpu](https://github.com/google-research/t5x/blob/main/t5x/contrib/gpu/scripts_gpu/README.md). The `t5x/contrib/gpu/scripts_gpu` folder contains example scripts for pretraining T5X on [The Pile](https://pile.eleuther.ai/) and for finetuning on SQuAD and MNLI. These scripts and associated `gin` configurations also contain additional GPU optimizations for better throughput.
 
@@ -122,7 +125,7 @@ the TPU VM instance unless otherwise stated.
 
 6.  (optional) If you prefer working with Jupyter/Colab style environment
     you can setup a custom Colab runtime by following steps from
-    [t5x/notebooks](t5x/notebooks/README.md).
+    [t5x/notebooks](https://github.com/google-research/t5x/blob/main/t5x/notebooks/README.md).
 
 ## Example: English to German translation
 

@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -104,6 +104,25 @@ def get_t5_test_model(optimizer_def,
       optimizer_def=optimizer_def)
 
 
+def sgd_with_multi_transform():
+  """Uses optax.multi_transform to train only decoder parameters."""
+
+  def _mask_fn(params):
+    mask = jax.tree_util.tree_map(lambda _: False, params)
+    mask = mask.copy(
+        {'decoder': jax.tree_util.tree_map(lambda _: True, mask['decoder'])}
+    )
+    return mask
+
+  return optax.multi_transform(
+      {
+          False: optax.set_to_zero(),
+          True: optax.sgd(1e-2, 0.0),
+      },
+      _mask_fn,
+  )
+
+
 class BasicTest(chex.TestCase):
 
   @classmethod
@@ -185,6 +204,7 @@ class BasicTest(chex.TestCase):
       ('adam', lambda: optax.adam(1e-1)),
       ('adamw', lambda: optax.adamw(1e-1)),
       ('lamb', lambda: optax.adamw(1e-1)),
+      ('lion', lambda: optax.lion(1e-2)),
       ('rmsprop', lambda: optax.rmsprop(1e-1)),
       ('rmsprop_momentum', lambda: optax.rmsprop(5e-2, momentum=0.9)),
       ('fromage', lambda: optax.fromage(1e-2)),
@@ -261,7 +281,7 @@ class OptaxWrapperTest(chex.TestCase):
     partitioner = partitioning.PjitPartitioner(
         num_partitions=2,
         logical_axis_rules=partitioning.standard_logical_axis_rules(),
-        use_cpu_pjit=True)
+    )
 
     train_state_initializer = utils.TrainStateInitializer(
         optimizer_def=model.optimizer_def,
@@ -291,9 +311,11 @@ class OptaxWrapperTest(chex.TestCase):
 
     # check save/restore structural equality
     restored_instance = trainer_instance.train_state.restore_state(
-        trainer_instance.train_state.state_dict())
-    chex.assert_tree_all_equal_structs(trainer_instance.train_state,
-                                       restored_instance)
+        trainer_instance.train_state.state_dict()
+    )
+    chex.assert_trees_all_equal_structs(
+        trainer_instance.train_state, restored_instance
+    )
 
   # NOTE(levskaya): these are surprisingly slow tests on CPU.
   @parameterized.parameters(
@@ -301,12 +323,14 @@ class OptaxWrapperTest(chex.TestCase):
       ('adam', lambda: optax.adam(1e-1)),
       ('adamw', lambda: optax.adamw(1e-1)),
       ('lamb', lambda: optax.adamw(1e-1)),
+      ('lion', lambda: optax.lion(1e-2)),
       # ('rmsprop', lambda: optax.rmsprop(1e-1)),
       # ('rmsprop_momentum', lambda: optax.rmsprop(5e-2, momentum=0.9)),
       # ('fromage', lambda: optax.fromage(1e-2)),
       ('adabelief', lambda: optax.adabelief(1e-1)),
       # ('radam', lambda: optax.radam(1e-1)),
       ('yogi', lambda: optax.yogi(1.0)),
+      ('multi_transform', sgd_with_multi_transform),
   )
   def test_optimizer(self, opt_name, opt_fn):
     opt = opt_fn()

@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 """Tests for t5x.trainer_lib."""
 import collections
-import contextlib
 import os
 
 from absl.testing import absltest
@@ -25,7 +24,6 @@ import clu.metrics
 import clu.values
 import flax
 import jax
-from jax._src import dispatch as jax_dispatch
 import jax.numpy as jnp
 import numpy as np
 from t5x import metrics as metrics_lib
@@ -42,15 +40,6 @@ mock = absltest.mock
 jax.config.parse_flags_with_absl()
 
 FlaxMutables = flax.core.FrozenDict
-
-
-# Make `log_elapsed_time` a no-op to simplify mocking of `time.time()`.
-@contextlib.contextmanager
-def fake_log_elapsed_time(_, event=None):  # pylint: disable=unused-argument
-  yield
-
-
-jax_dispatch.log_elapsed_time = fake_log_elapsed_time
 
 
 def _validate_events(test_case, summary_dir, expected_metrics, steps):
@@ -160,11 +149,9 @@ class MetricsManagerTest(absltest.TestCase):
         'steps_per_second': clu.values.Scalar(0.05),
         'text': clu.values.Text('test metric')
     }
-    with mock.patch(
-        'jax.process_index', return_value=0), mock.patch(
-            'time.time',
-            side_effect=[0, 40]  # start_time, end_time
-        ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+    with mock.patch('jax.process_index', return_value=0), mock.patch(
+        't5x.trainer._time', side_effect=[0, 40]  # start_time, end_time
+    ):
       mm = trainer_lib.MetricsManager('eval', summary_dir=self.model_dir)
       mm.start_duration_timer()
       summary = mm.write_metrics_summary(
@@ -197,9 +184,9 @@ class MetricsManagerTest(absltest.TestCase):
 
     n = 10
     with mock.patch(
-        'time.time',
-        side_effect=range(2 * n)  # start_time, end_time
-    ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+        't5x.trainer._time',
+        side_effect=range(2 * n),  # start_time, end_time
+    ):
       for _ in range(n):
         mm.start_duration_timer()
         summary = mm.write_metrics_summary({'time': metrics_lib.Time()}, 0, 1)
@@ -249,9 +236,17 @@ def fake_eval_fn_without_weight_sum(params, batch):
   return loss, {'loss': loss, 'accuracy': metrics_lib.Sum(i)}
 
 
-def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
-  del callable_fn
+def fake_eval_fn_with_mutables(params, batch, flax_mutables):
+  assert flax_mutables is not None
+  del flax_mutables
+  del params
+  # Add `i` to each metric.
+  i = batch['i'].sum()
+  loss = metrics_lib.Sum(i)
+  return loss, {'loss': loss, 'accuracy': metrics_lib.Sum(i)}
 
+
+def build_fake_grad_fn_without_weight_sum(has_aux, require_flax_mutables):
   def fake_grad_fn_without_weight_sum(train_state_params,
                                       batch,
                                       dropout_rng,
@@ -276,7 +271,7 @@ def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
     j = batch['j'].sum()
     metrics = {'loss': metrics_lib.Sum(j), 'accuracy': metrics_lib.Sum(j)}
 
-    if flax_mutables is not None:
+    if require_flax_mutables or flax_mutables is not None:
       aux = metrics, flax_mutables
     else:
       aux = metrics
@@ -287,6 +282,16 @@ def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
       return None, grad_accum.params
 
   return fake_grad_fn_without_weight_sum
+
+
+def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
+  del callable_fn
+  return build_fake_grad_fn_without_weight_sum(has_aux, False)
+
+
+def fake_value_and_grad_fn_wo_weight_sum_w_mutables(callable_fn, has_aux=False):
+  del callable_fn
+  return build_fake_grad_fn_without_weight_sum(has_aux, True)
 
 
 class TrainerTest(parameterized.TestCase):
@@ -313,10 +318,7 @@ class TrainerTest(parameterized.TestCase):
     self.dataset = tf.data.Dataset.range(6).map(mapfn).batch(
         2, drop_remainder=True)
 
-    with mock.patch(
-        'time.time',
-        side_effect=[0]  # trainer init
-    ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+    with mock.patch('t5x.trainer._time', side_effect=[0]):  # trainer init
       self.test_trainer = trainer_lib.Trainer(
           mock.create_autospec(models_lib.BaseModel, instance=True),
           self.init_train_state,
@@ -340,9 +342,10 @@ class TrainerTest(parameterized.TestCase):
 
     if precompile:
       with mock.patch(
-          'time.time',
-          side_effect=[0, 1]  # compile start, end
-      ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+          't5x.trainer._time', side_effect=[0, 1]  # compile start, end
+      ), mock.patch(
+          'absl.logging.log'
+      ):  # avoids hidden calls to time.time()
         trainer.compile_train(next(self.dataset.as_numpy_iterator()))
       trainer._compiled_train_step = mock.Mock(
           side_effect=trainer._compiled_train_step)
@@ -352,9 +355,9 @@ class TrainerTest(parameterized.TestCase):
 
     num_steps = 2
     with mock.patch(
-        'time.time',
-        side_effect=[1, 5, 6]  # start_time, uptime logged, end_time
-    ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+        't5x.trainer._time',
+        side_effect=[1, 5, 6],  # start_time, uptime logged, end_time
+    ):
       trainer.train(self.dataset.as_numpy_iterator(), num_steps).result()
 
     initial_metrics = {
@@ -413,9 +416,11 @@ class TrainerTest(parameterized.TestCase):
     if precompile:
       # [task1 start, task1 end, task2 start, task2 end]
       with mock.patch(
-          'time.time',
-          side_effect=[0, 1, 2, 3]  # [t1 start, t1 end, t2 start, t2 end]
-      ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+          't5x.trainer._time',
+          side_effect=[0, 1, 2, 3],  # [t1 start, t1 end, t2 start, t2 end]
+      ), mock.patch(
+          'absl.logging.log'
+      ):  # avoids hidden calls to time.time()
         trainer.compile_eval({
             task: next(ds.as_numpy_iterator())
             for task, ds in task_datasets.items()
@@ -429,9 +434,9 @@ class TrainerTest(parameterized.TestCase):
         side_effect=trainer._partitioned_eval_step)
 
     with mock.patch(
-        'time.time',
-        side_effect=[1, 5, 5, 8]  # t1 start, t1 end, t2 start, t2 end]
-    ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
+        't5x.trainer._time',
+        side_effect=[1, 5, 5, 8],  # t1 start, t1 end, t2 start, t2 end]
+    ):
       trainer.eval(
           {task: ds.as_numpy_iterator() for task, ds in task_datasets.items()})
 
@@ -477,16 +482,16 @@ class TrainerTest(parameterized.TestCase):
           'testcase_name': 'max_no_increase',
           'mode': 'max',
           'metrics': [1, 1, 1],
-          'atol': 0.,
-          'rtol': 0.,
+          'atol': 0.0,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
           'testcase_name': 'max_no_atol',
           'mode': 'max',
           'metrics': [1, 0.9, 0.8],
-          'atol': 0.,
-          'rtol': 0.,
+          'atol': 0.0,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
@@ -494,7 +499,7 @@ class TrainerTest(parameterized.TestCase):
           'mode': 'max',
           'metrics': [1, 1.09, 1.18],
           'atol': 0.1,
-          'rtol': 0.,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
@@ -502,7 +507,7 @@ class TrainerTest(parameterized.TestCase):
           'mode': 'max',
           'metrics': [1, 1.2, 1.4],
           'atol': 0.1,
-          'rtol': 0.,
+          'rtol': 0.0,
           'stop_training': False,
       },
       {
@@ -519,7 +524,7 @@ class TrainerTest(parameterized.TestCase):
           'testcase_name': 'max_not_enough_rtol',
           'mode': 'max',
           'metrics': [1, 1.2, 1.4],
-          'atol': 0.,
+          'atol': 0.0,
           'rtol': 0.2,
           'stop_training': True,
       },
@@ -527,16 +532,16 @@ class TrainerTest(parameterized.TestCase):
           'testcase_name': 'min_no_decrease',
           'mode': 'min',
           'metrics': [1, 1, 1],
-          'atol': 0.,
-          'rtol': 0.,
+          'atol': 0.0,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
           'testcase_name': 'min_no_atol',
           'mode': 'min',
           'metrics': [1, 1, 1],
-          'atol': 0.,
-          'rtol': 0.,
+          'atol': 0.0,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
@@ -544,7 +549,7 @@ class TrainerTest(parameterized.TestCase):
           'mode': 'min',
           'metrics': [1, 0.9, 0.71],
           'atol': 0.2,
-          'rtol': 0.,
+          'rtol': 0.0,
           'stop_training': True,
       },
       {
@@ -552,7 +557,7 @@ class TrainerTest(parameterized.TestCase):
           'mode': 'min',
           'metrics': [1, 0.8, 0.6],
           'atol': 0.15,
-          'rtol': 0.,
+          'rtol': 0.0,
           'stop_training': False,
       },
       {
@@ -578,25 +583,60 @@ class TrainerTest(parameterized.TestCase):
           'mode': 'min',
           'metrics': [1, 0.8, 0.7, 0.6],
           'atol': 0.15,
-          'rtol': 0.,
+          'rtol': 0.0,
           'stop_training': True,
-      }
+      },
   ])
-  def test_early_stopping_action(self, mode, metrics, atol, rtol,
-                                 stop_training):
+  def test_early_stopping_action(
+      self, mode, metrics, atol, rtol, stop_training
+  ):
     trainer = self.test_trainer
     metrics = [clu.values.Scalar(metric) for metric in metrics]
-    hook = trainer_lib.EarlyStoppingAction(('test_task', 'metric'),
-                                           mode=mode,
-                                           patience=3,
-                                           atol=atol,
-                                           rtol=rtol)
+    hook = trainer_lib.EarlyStoppingAction(
+        ('test_task', 'metric'), mode=mode, patience=3, atol=atol, rtol=rtol
+    )
 
     for metric in metrics:
-      trainer_stop_training = hook.run(trainer.train_state,
-                                       {'test_task': {
-                                           'metric': metric
-                                       }})
+      trainer_stop_training = hook.run(
+          trainer.train_state, {'test_task': {'metric': metric}}
+      )
+
+    self.assertEqual(trainer_stop_training, stop_training)
+
+  @parameterized.named_parameters([
+      {
+          'testcase_name': 'allow_clu_scalar_early_stopping',
+          'metrics': [
+              clu.values.Scalar(1),
+              clu.values.Scalar(0.9),
+              clu.values.Scalar(0.71),
+          ],
+          'atol': 0.2,
+          'stop_training': True,
+      },
+      {
+          'testcase_name': 'allow_float_early_stopping',
+          'metrics': [1.0, 0.9, 0.71],
+          'atol': 0.2,
+          'stop_training': True,
+      },
+      {
+          'testcase_name': 'error_for_other_type',
+          'metrics': [3, 2, 1],
+          'atol': 1.1,
+          'stop_training': False,
+      },
+  ])
+  def test_early_stopping_action_value(self, metrics, atol, stop_training):
+    trainer = self.test_trainer
+    hook = trainer_lib.EarlyStoppingAction(
+        ('test_task', 'metric'), mode='min', patience=3, atol=atol
+    )
+
+    for metric in metrics:
+      trainer_stop_training = hook.run(
+          trainer.train_state, {'test_task': {'metric': metric}}
+      )
 
     self.assertEqual(trainer_stop_training, stop_training)
 
@@ -612,12 +652,6 @@ class TrainerTest(parameterized.TestCase):
           'task': 'task',
           'metric': 'wrong_metric_name',
           'value': clu.values.Scalar(np.nan),
-      },
-      {
-          'testcase_name': 'invalid_value',
-          'task': 'task',
-          'metric': 'metric',
-          'value': 1.0,
       },
   ])
   def test_early_stopping_action_error(self, task, metric, value):
@@ -709,7 +743,7 @@ class TrainerTest(parameterized.TestCase):
         'j': np.ones((), dtype=np.float32)
     }
     # compile start, compile end
-    with mock.patch('time.time', side_effect=[1, 5]):
+    with mock.patch('t5x.trainer._time', side_effect=[1, 5]):
       trainer.compile_train(batch)
 
     trainer.train_metrics_manager.write_scalar.assert_called_with(
@@ -749,7 +783,9 @@ class TrainerTest(parameterized.TestCase):
     }
 
     # eval1 start/end, eval2 start/end, eval3 start/end, eval 4 start/end
-    with mock.patch('time.time', side_effect=[1, 5, 6, 9, 10, 11, 12, 13]):
+    with mock.patch(
+        't5x.trainer._time', side_effect=[1, 5, 6, 9, 10, 11, 12, 13]
+    ):
       trainer.compile_eval(collections.OrderedDict(sorted(batches.items())))
 
     trainer.eval_metrics_managers['eval1'].write_scalar.assert_called_with(
@@ -874,7 +910,7 @@ class TrainerRngDeterminismTest(parameterized.TestCase):
       del model, batch, num_microbatches, data_partition_spec
       # Add 1, which will increment the step as a side effect.
       grad_accum = jax.tree_map(lambda x: 1, optimizer)
-      m = {'rng': metrics_lib.Sum(jnp.sum(rng))}
+      m = {'rng': metrics_lib.Sum(jnp.sum(jax.random.key_data(rng)))}
       return grad_accum, m, None
 
     mock_accum_grads.side_effect = fake_accum_grads_rng
@@ -891,8 +927,12 @@ class TrainerRngDeterminismTest(parameterized.TestCase):
     metrics = trainer.train(iter(ds), num_steps=end_step - start_step)
     base_rng = jax.random.PRNGKey(random_seed)
     expected_rng_sum = np.sum(
-        [jax.random.fold_in(base_rng, i) for i in range(start_step, end_step)],
-        dtype=np.uint32)
+        [
+            jax.random.key_data(jax.random.fold_in(base_rng, i))
+            for i in range(start_step, end_step)
+        ],
+        dtype=np.uint32,
+    )
     np.testing.assert_array_equal(metrics.result()['rng'].value,
                                   expected_rng_sum)
 
@@ -960,7 +1000,7 @@ class MutableTrainerTest(parameterized.TestCase):
         learning_rate_fn=lambda step: 2 * (step + 1),
         num_microbatches=None)
 
-  @mock.patch('time.time')
+  @mock.patch('t5x.trainer._time')
   @mock.patch('t5x.trainer.accumulate_grads_microbatched', fake_mut_accum_grads)
   @mock.patch('t5x.trainer.apply_grads', fake_mut_apply_grads)
   # avoids calls time.time() during logging
@@ -1006,21 +1046,40 @@ class MutableTrainerTest(parameterized.TestCase):
     self.assertEqual(metrics['accuracy'].compute(), 2)
     self.assertIsNotNone(flax_mutables)
 
-  @mock.patch('jax.value_and_grad', fake_value_and_grad_fn_without_weight_sum)
+  @mock.patch(
+      'jax.value_and_grad', fake_value_and_grad_fn_wo_weight_sum_w_mutables
+  )
   def test_accumulate_grads_microbatched_without_weight_sum_multiple_batches(
       self):
     batch_iter = self.dataset.as_numpy_iterator()
     batch = next(batch_iter)
     num_micro_batches = 2
-    grad_accum, metrics, flax_mutables = trainer_lib.accumulate_grads_microbatched(
-        self.test_trainer._model, self.init_train_state, batch,
-        self.test_trainer._base_rng, num_micro_batches)
+    grad_accum, metrics, flax_mutables = (
+        trainer_lib.accumulate_grads_microbatched(
+            self.test_trainer._model,
+            self.init_train_state,
+            batch,
+            self.test_trainer._base_rng,
+            num_micro_batches,
+        )
+    )
 
     expected_grad_accum = {'bias': jnp.ones(4), 'kernel': jnp.ones((2, 4))}
     chex.assert_trees_all_equal(expected_grad_accum, grad_accum)
     self.assertEqual(metrics['loss'].compute(), 2)
     self.assertEqual(metrics['accuracy'].compute(), 2)
     self.assertIsNotNone(flax_mutables)
+
+  def test_eval_step(self):
+    batch_iter = self.dataset.as_numpy_iterator()
+    batch = next(batch_iter)
+    self.test_trainer._model.eval_fn = fake_eval_fn_with_mutables
+    metrics = trainer_lib.eval_step(
+        self.test_trainer._model, self.init_train_state, batch
+    )
+
+    self.assertEqual(metrics['loss'].compute(), 1)
+    self.assertEqual(metrics['accuracy'].compute(), 1)
 
   def tearDown(self) -> None:
     # Manually close managers to avoid phantom threads crossing test cases.

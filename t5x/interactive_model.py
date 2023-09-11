@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -183,11 +183,13 @@ class InteractiveModel(abc.ABC):
     # Define restore and save checkpoints.
     if checkpoint_path:
       self._restore_checkpoint_cfg = utils.RestoreCheckpointConfig(
-          dtype=dtype, mode=restore_mode, path=checkpoint_path, use_gda=False)
+          dtype=dtype, mode=restore_mode, path=checkpoint_path
+      )
     else:
       self._restore_checkpoint_cfg = None
     self._save_checkpoint_cfg = utils.SaveCheckpointConfig(
-        dtype=dtype, keep=5, save_dataset=False, use_gda=False, period=1000)
+        dtype=dtype, keep=5, save_dataset=False, period=1000
+    )
     self._train_state_initializer = utils.TrainStateInitializer(
         optimizer_def=self._model.optimizer_def,
         init_fn=self._model.get_initial_variables,
@@ -200,11 +202,12 @@ class InteractiveModel(abc.ABC):
         save_cfg=self._save_checkpoint_cfg,
         restore_cfg=self._restore_checkpoint_cfg,
         train_state_shape=(
-            self._train_state_initializer.global_train_state_shape),
+            self._train_state_initializer.global_train_state_shape
+        ),
         partitioner=self._partitioner,
         ds_iter=None,
         model_dir=self._output_dir,
-        use_gda=False)
+    )
 
     # --------------------------------------------------------------------------
     # Restore a model from a checkpoint or from scratch.
@@ -239,8 +242,9 @@ class InteractiveModel(abc.ABC):
             state_transformation_fns=state_transforms_for_restore))
 
     # Restore the model using a checkpoint.
-    valid_restore_cfg, restore_paths = utils.get_first_valid_restore_config_and_paths(
-        restore_cfgs)
+    valid_restore_cfg, restore_paths = (
+        utils.get_first_valid_restore_config_and_paths(restore_cfgs)
+    )
     self._train_state = self._checkpoint_manager.restore(
         restore_paths, valid_restore_cfg,
         utils.get_fallback_state(valid_restore_cfg, get_state, self._init_rng))
@@ -852,7 +856,7 @@ def get_dataset_from_natural_text_examples(
   # ------------------------------------------------------------------------
   # Construct a `tf.data.Dataset` from the provided examples
   # ------------------------------------------------------------------------
-  merged_examples = {"inputs": [], "targets": [], "answers": []}
+  merged_examples = {"inputs": [], "targets": []}
   for example in examples:
     # If the provided example is just a string, add an empty target string
     if isinstance(example, dict):
@@ -861,8 +865,6 @@ def get_dataset_from_natural_text_examples(
       example_dict = {"input": example, "target": ""}
     merged_examples["inputs"].append(example_dict["input"])
     merged_examples["targets"].append(example_dict["target"])
-    # Answers is a list of possible targets (in this case a single target).
-    merged_examples["answers"].append([example_dict["target"]])
   dataset = tf.data.Dataset.from_tensor_slices(merged_examples)
 
   # Define `ShardInfo` that doesn't shard the data pipeline.
@@ -979,19 +981,22 @@ def get_batches_from_seqio(
       SeqIO `get_dataset()` call.
 
   Returns:
-    A sequence of batches, where each batch is a sequnce of examples. Each
+    A sequence of batches, where each batch is a sequence of examples. Each
       example is a dictionary mapping 'input' and 'target' to the corresponding
       values for a single example.
   """
   task_or_mixture = seqio.get_mixture_or_task(task_or_mixture_name)
   total_examples_requested = batch_size * num_batches
   dataset = task_or_mixture.get_dataset(
-      sequence_length=sequence_length, split=split, **get_dataset_kwargs)
+      sequence_length=sequence_length, split=split, **get_dataset_kwargs
+  )
 
   all_batches = []
   current_batch = []
   input_key = "inputs_pretokenized" if get_pretokenized_examples else "inputs"
-  target_key = "targets_pretokenized" if get_pretokenized_examples else "targets"
+  target_key = (
+      "targets_pretokenized" if get_pretokenized_examples else "targets"
+  )
   total_examples_seen = 0
   # It should be noted that we could replace the following loop with tf.Dataset
   # operations (like

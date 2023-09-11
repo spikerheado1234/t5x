@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -420,7 +420,7 @@ def _temperature_sample_single_trial(
   """A helper function for `temperature_sample`."""
 
   # We can check the values of topp and topk only if they are not dynamic.
-  if not _is_tracer(topp) and topp and topk:
+  if not (_is_tracer(topp) or _is_tracer(topk)) and topp and topk:
     raise ValueError('At most one of `topp` or `topk` may be non-zero.')
 
   batch_size, max_decode_len = inputs.shape
@@ -511,12 +511,15 @@ def _temperature_sample_single_trial(
     # Split RNG for sampling.
     rng1, rng2 = random.split(state.rng)
     # Call fast-decoder model on current tokens to get next-position logits.
+    frozen = isinstance(state.cache, flax.core.FrozenDict)
     decoding_state = DecodingState(
         cur_index=state.cur_index,
         sequences=state.sequences[:, :-extra_input_tokens],
         cur_token=state.cur_token,
         cache=state.cache)
     logits, new_cache = tokens_to_logits(decoding_state)
+    if frozen:
+      new_cache = flax.core.freeze(new_cache)
     # Sample next token from logits.
 
     if logit_callback_fn is not None:
@@ -524,8 +527,12 @@ def _temperature_sample_single_trial(
 
     def sample_logits_with_nonzero_temperature(logits, temperature):
       scaled_logits = logits / jnp.maximum(temperature, MIN_TEMPERATURE)
-      if topk:
-        scaled_logits = binary_search.topk_mask(scaled_logits, topk, NEG_INF)  # pytype: disable=wrong-arg-types  # jax-ndarray
+      if _is_tracer(topk) or topk:
+        scaled_logits = jax.lax.cond(
+            topk > 0,
+            lambda: binary_search.topk_mask(scaled_logits, topk, NEG_INF),  # pytype: disable=wrong-arg-types  # jax-ndarray
+            lambda: scaled_logits,
+        )
 
       # When topp is dynamic, we always use it since we cannot check
       # non-zeroness (but it will have no effect if topp is 0.0).

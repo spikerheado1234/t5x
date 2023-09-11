@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +36,9 @@ import tensorflow as tf
 import typing_extensions
 
 
-Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
+# Remove _ShardedDeviceArray when users of t5x have their types updated
+_ShardedDeviceArray = Any
+Array = Union[np.ndarray, jnp.ndarray, _ShardedDeviceArray, tf.Tensor]
 MetricsMap = metrics_lib.MetricsMap
 PyTree = Any
 

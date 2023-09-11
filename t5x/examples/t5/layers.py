@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,6 +67,7 @@ def performer_dot_product_attention(query: Array,
     key: `[batch, kv_length, num_heads, qk_depth_per_head]`.
     value: `[batch, kv_length, num_heads, v_depth_per_head]`. 
   """
+  print('performer executing')
   assert key.ndim == query.ndim == value.ndim, 'q, k, v must have same rank.'
   assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], (
       'q, k, v batch dims must match.')
@@ -370,7 +371,7 @@ class MultiHeadDotProductAttention(nn.Module):
       dropout_rng = self.make_rng('dropout')
 
     # Apply attention.
-    x = dot_product_attention(
+    x = performer_dot_product_attention(
         query,
         key,
         value,

@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -124,6 +124,10 @@ def precompile(
   compiled = lowered.compile()
   output_path = os.path.join(model_dir, 'lowered_hlo_post_optimization')
   with tf.io.gfile.GFile(output_path, 'w') as f:
-    f.write(compiled.compiler_ir()[0].as_serialized_hlo_module_proto())
+    f.write(
+        compiled.runtime_executable()
+        .hlo_modules()[0]
+        .as_serialized_hlo_module_proto()
+    )
   with tf.io.gfile.GFile(os.path.join(model_dir, 'assignment'), 'wb') as f:
     np.save(f, partitioner.mesh.device_ids)

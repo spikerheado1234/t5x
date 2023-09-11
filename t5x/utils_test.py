@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ from absl.testing import parameterized
 import flax.core
 from flax.linen import partitioning as flax_partitioning
 import jax
+from jax.experimental.pjit import pjit
 import numpy as np
 import seqio
 from t5x import checkpoints
@@ -40,6 +41,7 @@ mock = absltest.mock
 Evaluator = seqio.Evaluator
 PartitionSpec = partitioning.PartitionSpec
 AxisMetadata = flax_partitioning.AxisMetadata
+FlaxMutables = flax.core.FrozenDict
 
 # Parse absl flags test_srcdir and test_tmpdir.
 jax.config.parse_flags_with_absl()
@@ -47,14 +49,14 @@ jax.config.parse_flags_with_absl()
 FLAGS = flags.FLAGS
 
 
-def get_mock_train_state(params, param_states=None, step=0):
+def get_mock_train_state(params, param_states=None, step=0, flax_mutables=None):
   """Returns a mock TrainState."""
   step = np.array(step) if step is not None else None
   state = mock.Mock(param_states=param_states, step=step)
   state_dict = dict(
       target=params, state=dict(param_states=param_states, step=step)
   )
-  return mock.Mock(
+  args = dict(
       params=params,
       param_states=param_states,
       step=step,
@@ -62,7 +64,9 @@ def get_mock_train_state(params, param_states=None, step=0):
       optimizer=mock.Mock(
           target=params, state=state, state_dict=lambda: state_dict
       ),
+      flax_mutables=flax_mutables,
   )
+  return mock.Mock(**args)
 
 
 class UtilsTest(parameterized.TestCase):
@@ -598,17 +602,17 @@ class UtilsTest(parameterized.TestCase):
         }),
     )
 
-  def test_create_checkpoint_manager_validate(self):
+  def test_create_orbax_checkpoint_manager_validate(self):
     directory = "path/to/dir"
     path = os.path.join(directory, "checkpoint")
     save_cfg = utils.SaveCheckpointConfig(
-        checkpoint_manager_cls=checkpoints.BestCheckpointManager
+        checkpoint_manager_cls=checkpoints.OrbaxCheckpointManagerInterface
     )
     restore_cfg = utils.RestoreCheckpointConfig(
         path=path, checkpoint_manager_cls=None
     )
     with self.assertRaises(ValueError):
-      utils.create_checkpoint_manager(
+      utils.create_orbax_checkpoint_manager(
           save_cfg=save_cfg,
           restore_cfg=restore_cfg,
           train_state=mock.Mock(),
@@ -620,24 +624,24 @@ class UtilsTest(parameterized.TestCase):
       dict(
           testcase_name="using_best_checkpoint_manager",
           checkpointer_cls=checkpoints.Checkpointer,
-          checkpoint_manager_cls=checkpoints.BestCheckpointManager,
-          metric_name_to_monitor={"train/accuracy": 0.8, "train/loss": 0.1},
+          checkpoint_manager_cls=checkpoints.OrbaxCheckpointManagerInterface,
+          metrics=None,
           expected_metric_mode="max",
           expected_force_keep_period=None,
           expected_keep_checkpoints_without_metrics=True,
-          expected_metric=0.8,
+          expected_metric=None,
       ),
       dict(
           testcase_name="using_functools_partial_for_checkpoint_manager_cls",
           checkpointer_cls=checkpoints.Checkpointer,
           checkpoint_manager_cls=functools.partial(
-              checkpoints.BestCheckpointManager,
+              checkpoints.OrbaxCheckpointManagerInterface,
               metric_name_to_monitor="loss",
               metric_mode="min",
               force_keep_period=10,
               keep_checkpoints_without_metrics=False,
           ),
-          metric_name_to_monitor={"accuracy": 0.8, "loss": 0.1},
+          metrics={"accuracy": 0.8, "loss": 0.1},
           expected_metric_mode="min",
           expected_force_keep_period=10,
           expected_keep_checkpoints_without_metrics=False,
@@ -646,8 +650,8 @@ class UtilsTest(parameterized.TestCase):
       dict(
           testcase_name="using_save_best_checkpointer",
           checkpointer_cls=checkpoints.SaveBestCheckpointer,
-          checkpoint_manager_cls=checkpoints.CheckpointManager,
-          metric_name_to_monitor={"train/accuracy": 0.8, "train/loss": 0.1},
+          checkpoint_manager_cls=checkpoints.OrbaxCheckpointManagerInterface,
+          metrics={"train/accuracy": 0.8, "train/loss": 0.1},
           expected_metric_mode="max",
           expected_force_keep_period=None,
           expected_keep_checkpoints_without_metrics=True,
@@ -662,19 +666,19 @@ class UtilsTest(parameterized.TestCase):
               force_keep_period=20,
               keep_checkpoints_without_metrics=False,
           ),
-          checkpoint_manager_cls=checkpoints.CheckpointManager,
-          metric_name_to_monitor={"train/accuracy": 0.8, "train/loss": 0.1},
+          checkpoint_manager_cls=checkpoints.OrbaxCheckpointManagerInterface,
+          metrics={"train/accuracy": 0.8, "train/loss": 0.1},
           expected_metric_mode="min",
           expected_force_keep_period=20,
           expected_keep_checkpoints_without_metrics=False,
           expected_metric=0.1,
       ),
   )
-  def test_create_checkpoint_manager(
+  def test_create_orbax_checkpoint_manager(
       self,
       checkpointer_cls,
       checkpoint_manager_cls,
-      metric_name_to_monitor: Mapping[str, float],
+      metrics: Mapping[str, float],
       expected_metric_mode: str,
       expected_force_keep_period: int,
       expected_keep_checkpoints_without_metrics: bool,
@@ -702,7 +706,7 @@ class UtilsTest(parameterized.TestCase):
         restore_dataset=False,
     )
 
-    manager = utils.create_checkpoint_manager(
+    manager = utils.create_orbax_checkpoint_manager(
         save_cfg=save_cfg,
         restore_cfg=restore_cfg,
         train_state=mock.Mock(),
@@ -711,28 +715,32 @@ class UtilsTest(parameterized.TestCase):
         model_dir=directory,
     )
 
-    self.assertIsInstance(manager, checkpoints.BestCheckpointManager)
-    self.assertEqual(manager._options.max_to_keep, 5)
-    self.assertEqual(manager._options.save_interval_steps, 2)
+    self.assertIsInstance(manager, checkpoints.OrbaxCheckpointManagerInterface)
+    self.assertEqual(manager._manager._options.max_to_keep, 5)
+    self.assertEqual(manager._manager._options.save_interval_steps, 2)
     self.assertEqual(manager._save_dtype, "float32")
     self.assertEqual(manager._restore_dtype, "bfloat16")
     self.assertTrue(manager._should_write_dataset_ckpt)
 
     # Save best options.
     self.assertEqual(
-        manager._options.force_keep_period, expected_force_keep_period
+        manager._manager._options.keep_period, expected_force_keep_period
     )
-    self.assertEqual(manager._options.best_mode, expected_metric_mode)
+    self.assertEqual(manager._manager._options.best_mode, expected_metric_mode)
     self.assertEqual(
-        manager._options.keep_checkpoints_without_metrics,
+        manager._manager._options.keep_checkpoints_without_metrics,
         expected_keep_checkpoints_without_metrics,
     )
-    self.assertEqual(
-        manager._options.best_fn(metric_name_to_monitor), expected_metric
-    )
+    if expected_metric is None:
+      self.assertIsNone(manager._manager._options.best_fn)
+    else:
+      self.assertEqual(
+          manager._manager._options.best_fn(metrics),
+          expected_metric,
+      )
 
   @parameterized.parameters((True,), (False,))
-  def test_create_checkpoint_manager_from_checkpointer(
+  def test_create_orbax_checkpoint_manager_from_checkpointer(
       self, set_save_checkpointer_cls
   ):
     directory = self.create_tempdir(name="all_checkpoints")
@@ -765,7 +773,7 @@ class UtilsTest(parameterized.TestCase):
         restore_dataset=False,
     )
 
-    manager = utils.create_checkpoint_manager(
+    manager = utils.create_orbax_checkpoint_manager(
         save_cfg=save_cfg,
         restore_cfg=restore_cfg,
         train_state=mock.Mock(),
@@ -774,19 +782,21 @@ class UtilsTest(parameterized.TestCase):
         model_dir=directory,
     )
 
-    self.assertIsInstance(manager, checkpoints.BestCheckpointManager)
-    self.assertEqual(manager._options.max_to_keep, 5)
-    self.assertEqual(manager._options.save_interval_steps, 2)
+    self.assertIsInstance(manager, checkpoints.OrbaxCheckpointManagerInterface)
+    self.assertEqual(manager._manager._options.max_to_keep, 5)
+    self.assertEqual(manager._manager._options.save_interval_steps, 2)
     self.assertEqual(manager._save_dtype, "float32")
     self.assertEqual(manager._restore_dtype, "bfloat16")
     self.assertTrue(manager._should_write_dataset_ckpt)
 
     # Save best options.
-    self.assertIsNone(manager._options.force_keep_period, None)
-    self.assertEqual(manager._options.best_mode, "max")
-    self.assertTrue(manager._options.keep_checkpoints_without_metrics)
+    self.assertIsNone(manager._manager._options.keep_period, None)
+    self.assertEqual(manager._manager._options.best_mode, "max")
+    self.assertTrue(manager._manager._options.keep_checkpoints_without_metrics)
     self.assertEqual(
-        manager._options.best_fn({"train/accuracy": 0.8, "train/loss": 0.1}),
+        manager._manager._options.best_fn(
+            {"train/accuracy": 0.8, "train/loss": 0.1}
+        ),
         0.8,
     )
 
@@ -808,7 +818,7 @@ class MockCheckpointer(checkpoints.Checkpointer):
     return MockTrainState(path=path, from_scratch=False)
 
 
-class MockCheckpointManager(checkpoints.CheckpointManager):
+class MockCheckpointManager(checkpoints.OrbaxCheckpointManagerInterface):
 
   def __init__(self, *args, **kwargs):
     pass
@@ -881,8 +891,7 @@ class TrainStateInitializerTest(parameterized.TestCase):
           ),
       }
 
-    init_fn = mock.Mock()
-    init_fn.__call__ = _init_fn
+    init_fn = mock.Mock(side_effect=_init_fn)
     init_fn.__self__ = None
 
     self.train_state_init = utils.TrainStateInitializer(
@@ -992,6 +1001,95 @@ class TrainStateInitializerTest(parameterized.TestCase):
         [empty_ckpt_cfg], init_rng=init_rng
     )
     self.assertTrue(initialized.from_scratch)
+
+
+class MutableGetInferFnTest(parameterized.TestCase):
+
+  @parameterized.parameters((True,), (False,))
+  def test_get_infer_fn_predict(self, use_flax_mutables):
+    batch_size = 2
+    weight_const = 7
+    mutable_const = 5 if use_flax_mutables else 0
+    global_mesh = test_utils.create_global_mesh(
+        (1, 1, 1), ("model", "data", "chips")
+    )
+
+    def predict_batch(params, batch, flax_mutables):
+      result = (
+          flax_mutables["mutable_w"] * batch["b"] if use_flax_mutables else 0
+      )
+      return result + (params["weight"] * batch["a"])
+
+    def get_data_layout(batch_size):
+      assert batch_size == 2  # total batch size, not per-shard
+      assert jax.process_index() == 0
+      return partitioning.DataLayout(
+          batch_size=2,
+          shard_id=0,
+          num_shards=1,
+          is_first_host_in_replica_set=True,
+      )
+
+    def partition(fn, in_axis_resources, out_axis_resources):
+      fn = pjit(
+          fn,
+          in_shardings=in_axis_resources,
+          out_shardings=out_axis_resources,
+      )
+      return partitioning.PjittedFnWithContext(fn, global_mesh)
+
+    if use_flax_mutables:
+      flax_mutables_train_state = {"mutable_w": np.full((1,), mutable_const)}
+      flax_mutables_train_state_axes = {"mutable_w": PartitionSpec("model")}
+    else:
+      flax_mutables_train_state = None
+      flax_mutables_train_state_axes = None
+
+    train_state = get_mock_train_state(
+        params={"weight": np.full((1,), weight_const)},
+        flax_mutables=flax_mutables_train_state,
+    )
+    train_state_axes = get_mock_train_state(
+        params={"weight": PartitionSpec("model")},
+        flax_mutables=flax_mutables_train_state_axes,
+    )
+
+    partitioner = mock.Mock()
+    partitioner.data_partition_spec = PartitionSpec(
+        "data",
+    )
+    partitioner.get_data_layout = get_data_layout
+    partitioner.partition = partition
+    partitioner.mesh = global_mesh
+
+    def as_sharded_array(arr, axes, mesh=None):
+      with mesh:
+        return pjit(lambda x: x, in_shardings=None, out_shardings=axes)(arr)
+
+    train_state.params = jax.tree_util.tree_map(
+        functools.partial(as_sharded_array, mesh=global_mesh),
+        train_state.params,
+        train_state_axes.params,
+    )
+
+    infer_fn = utils.get_infer_fn(
+        predict_batch, batch_size, train_state_axes, partitioner=partitioner
+    )
+
+    ds = tf.data.Dataset.from_tensor_slices({
+        "a": np.transpose(np.tile(np.arange(8), (2, 1))),
+        "b": np.transpose(np.tile(np.arange(8), (2, 1))),
+    }).enumerate()
+
+    all_indices, all_inferences = zip(*infer_fn(ds, train_state))
+
+    np.testing.assert_equal(all_indices, np.arange(8))
+    np.testing.assert_equal(
+        all_inferences,
+        np.transpose(
+            np.tile(np.arange(8) * (weight_const + mutable_const), (2, 1))
+        ),
+    )
 
 
 if __name__ == "__main__":

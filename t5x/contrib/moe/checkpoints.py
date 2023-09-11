@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ from typing import Any, Optional, Union
 import clu.data
 import jax
 import jax.config
-from jax.experimental.gda_serialization import serialization as gda_serialization
+from jax.experimental.array_serialization import serialization as array_serialization
+from jax.experimental.pjit import pjit
 import jax.numpy as jnp
 import numpy as np
 from t5x import checkpoint_importer
@@ -81,13 +82,6 @@ class UpcycleCheckpointer(checkpoints.Checkpointer):
         keep. If more than this number of data iterators exist after a save, the
         oldest ones will be automatically deleted to save space.
     """
-    if not jax.config.jax_array:
-      raise ValueError(
-          'Sparse upcycling is currently only supported for '
-          'jax.Array(s). Please set `use_jax_array`=True in '
-          'the train library (train.py).'
-      )
-
     super().__init__(
         train_state=train_state,
         partitioner=partitioner,
@@ -161,18 +155,11 @@ class UpcycleCheckpointer(checkpoints.Checkpointer):
           )
         if restore_dtype is not None:
           arr = arr.astype(restore_dtype)
-        if jax.config.jax_array:
-          arr = jax.make_array_from_callback(
-              arr.shape,
-              jax.sharding.NamedSharding(mesh, axes),
-              lambda idx: arr[idx],
-          )
-        else:
-          arr = jax.make_array_from_callback(
-              arr.shape,
-              jax.sharding.NamedSharding(mesh, axes),
-              lambda idx: arr[idx],
-          )
+        arr = jax.make_array_from_callback(
+            arr.shape,
+            jax.sharding.NamedSharding(mesh, axes),
+            lambda idx: arr[idx],
+        )
       return arr
 
     return LazyAwaitableArray.from_tensor_store_spec_or_array(
@@ -300,7 +287,7 @@ async def _read_upcycle_ts(
     else:
       checkpoint_axes = axes
 
-    arr = await gda_serialization.async_deserialize(
+    arr = await array_serialization.async_deserialize(
         jax.sharding.NamedSharding(mesh, checkpoint_axes), tmp_ts_spec_dict
     )
 
@@ -324,10 +311,10 @@ async def _read_upcycle_ts(
 
       with mesh:
         upcycled_axes = axes
-        arr = partitioning.pjit(
+        arr = pjit(
             upcycle,
-            in_axis_resources=checkpoint_axes,
-            out_axis_resources=upcycled_axes,
+            in_shardings=checkpoint_axes,
+            out_shardings=upcycled_axes,
         )(arr)
 
   return arr

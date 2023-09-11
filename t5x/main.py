@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,10 +41,11 @@ from absl import app
 from absl import flags
 from absl import logging
 
+import fiddle as fdl
 import gin
-import jax
 import seqio
 
+from t5x import config_utils
 from t5x import gin_utils
 from t5x import utils
 
@@ -112,6 +113,10 @@ _ATTR_BY_RUN_MODE = {
     RunMode.EXPORT: 'save',
 }
 
+# Extra attributes to set in __main__ from the imported module. This is for
+# backward compatibility with existing __main__ references in gin files.
+_EXTRA_ATTRS_BY_RUN_MODE = {RunMode.INFER: ('create_task_from_tfexample_file',)}
+
 
 main_module = sys.modules[__name__]
 
@@ -143,47 +148,46 @@ def main(argv: Sequence[str]):
 
   entry_func = getattr(imported_lib, import_attr)
   setattr(main_module, import_attr, entry_func)
+  for attr_name in _EXTRA_ATTRS_BY_RUN_MODE.get(_RUN_MODE.value, ()):
+    setattr(main_module, attr_name, getattr(imported_lib, attr_name))
 
 
   if _TFDS_DATA_DIR.value is not None:
     seqio.set_tfds_data_dir_override(_TFDS_DATA_DIR.value)
 
 
-  # Register function explicitly under __main__ module, to maintain backward
-  # compatability of existing '__main__' module references.
-  gin.register(entry_func, '__main__')
-  if _GIN_SEARCH_PATHS.value != ['.']:
-    logging.warning(
-        'Using absolute paths for the gin files is strongly recommended.')
+  if config_utils.using_fdl():
+    config = config_utils.config_with_fiddle(entry_func)
+    run_with_fdl = fdl.build(config)
 
-  # User-provided gin paths take precedence if relative paths conflict.
-  gin_utils.parse_gin_flags(_GIN_SEARCH_PATHS.value + _DEFAULT_GIN_SEARCH_PATHS,
-                            _GIN_FILE.value, _GIN_BINDINGS.value)
+    if _DRY_RUN.value:
+      return
 
-  if _DRY_RUN.value:
-    return
+    run_with_fdl()
+  else:
+    # Register function explicitly under __main__ module, to maintain backward
+    # compatability of existing '__main__' module references.
+    gin.register(entry_func, '__main__')
+    if _GIN_SEARCH_PATHS.value != ['.']:
+      logging.warning(
+          'Using absolute paths for the gin files is strongly recommended.'
+      )
 
-  run_with_gin = gin.get_configurable(entry_func)
+    # User-provided gin paths take precedence if relative paths conflict.
+    gin_utils.parse_gin_flags(
+        _GIN_SEARCH_PATHS.value + _DEFAULT_GIN_SEARCH_PATHS,
+        _GIN_FILE.value,
+        _GIN_BINDINGS.value,
+    )
 
-  run_with_gin()
+    if _DRY_RUN.value:
+      return
 
+    run_with_gin = gin.get_configurable(entry_func)
 
+    run_with_gin()
 
-def _flags_parser(args: Sequence[str]) -> Sequence[str]:
-  """Flag parser.
-
-  See absl.app.parse_flags_with_usage and absl.app.main(..., flags_parser).
-
-  Args:
-    args: All command line arguments.
-
-  Returns:
-    [str], a non-empty list of remaining command line arguments after parsing
-    flags, including program name.
-  """
-  return app.parse_flags_with_usage(list(gin_utils.rewrite_gin_args(args)))
 
 
 if __name__ == '__main__':
-  jax.config.parse_flags_with_absl()
-  app.run(main, flags_parser=_flags_parser)
+  config_utils.run(main)

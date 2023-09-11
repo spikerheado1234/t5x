@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,9 +49,11 @@ PyTree = Any
 ConfigDict = ml_collections.ConfigDict
 DecoderParamsSpec = Sequence[Tuple[str, tf.DType, Sequence[int]]]
 PreprocessorFn = Callable[..., Mapping[str, tf.Tensor]]
-WarmupExamples = List[Union[Union[str, bytes], List[int]]]
+WarmupExample = Union[Union[str, bytes], List[int]]
+WarmupExamples = List[WarmupExample]
 PostprocessorFn = Callable[[Tuple[Any, Any]], Union[Tuple[Any, Any],
                                                     Mapping[str, Any]]]
+InferenceFn = Callable[[Mapping[str, Any], Any], PyTree]
 
 
 class CreatePreprocessorFnNew(typing_extensions.Protocol):
@@ -98,20 +100,9 @@ class CreateDecodingStateCallbackFn(typing_extensions.Protocol):
       vocab: seqio.Vocabulary,
       num_decodes: int = 1,
       output_feature_names: Optional[List[str]] = None,
+      call_tf_graph: bool = False,
   ) -> decoding.StateCallbackFn:
     ...
-
-
-def convert_buffer_to_ndarray(v):
-  """Convert `v` to a np.ndarray.
-
-  Args:
-    v: the value to be converted. Can be sharded or fully replicated.
-
-  Returns:
-    A np.ndarray that represents the full array value of `v`.
-  """
-  return np.asarray(v)
 
 
 class ExportableModule(tf.Module):
@@ -132,6 +123,7 @@ class ExportableModule(tf.Module):
       jit_compile: bool = True,
       use_batch_function: bool = False,
       use_gpu: bool = False,
+      enable_large_batch_splitting: bool = True,
   ):
     super().__init__()
 
@@ -139,7 +131,8 @@ class ExportableModule(tf.Module):
       flat_param_vars = {}
       for k, v in flax.traverse_util.flatten_dict(params).items():
         flat_param_vars[k] = tf.Variable(
-            convert_buffer_to_ndarray(v), trainable=False, name='__'.join(k))
+            np.asarray(v), trainable=False, name='__'.join(k)
+        )
       return flat_param_vars
 
     if use_gpu:
@@ -175,6 +168,7 @@ class ExportableModule(tf.Module):
     self._allowed_batch_sizes = allowed_batch_sizes
     self._use_batch_function = use_batch_function
     self._max_batch_size = max_batch_size
+    self._enable_large_batch_splitting = enable_large_batch_splitting
 
   @functools.partial(tf.function, autograph=False, jit_compile=False)
   def __call__(self, *input_batches) -> Tuple[Any, Any]:
@@ -200,6 +194,7 @@ class ExportableModule(tf.Module):
         max_batch_size=max_batch_size,
         batch_timeout_micros=self._batch_timeout_micros,
         allowed_batch_sizes=allowed_batch_sizes,
+        enable_large_batch_splitting=self._enable_large_batch_splitting,
     )
     flattended, tree_def = jax.tree_util.tree_flatten(input_batches)
     return batch_wrapper(functools.partial(self._call, tree_def=tree_def))(
@@ -223,10 +218,14 @@ class ExportableModule(tf.Module):
   def export_batch_sizes(self):
     return self._allowed_batch_sizes or [self._batch_size]
 
+  @tf.function(autograph=False, jit_compile=False)
+  def preproc_func(self, *args):
+    return self._preproc_tf_fn(*args)
+
 
 def get_train_state_initializer(
     model: models.BaseTransformerModel,
-    partitioner: partitioning.BasePartitioner,
+    partitioner: Optional[partitioning.BasePartitioner],
     task_feature_lengths: Mapping[str, int],
     batch_size: Optional[int],
     trailing_shapes: Optional[Mapping[str, Tuple[int, ...]]] = None,
@@ -245,7 +244,7 @@ def get_train_state_initializer(
   for k, l in model_feature_lengths.items():
     input_shapes[k] = (p_batch_size, l)
     if feature_converter.MODEL_FEATURES[k].rank > 1:
-      if k not in trailing_shapes:
+      if trailing_shapes is None or k not in trailing_shapes:
         raise ValueError(
             'Must set the trailing shape--`...?` in '
             '`(batch_size, seqlen, ...?)`--for higher rank '
@@ -294,6 +293,8 @@ def create_inference_function(
     enable_xla: bool = True,
     polymorphic_shapes_inputs: Optional[Any] = None,
     native_lowering: bool = False,
+    native_lowering_platforms: Sequence[str] = (),
+    model_fn_extra_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> Callable[[Mapping[str, Any], Any], PyTree]:
   """Fetches a model and returns the inference function based on inference_mode."""
   if partitioner and train_state_initializer:
@@ -316,8 +317,9 @@ def create_inference_function(
     else:
       raise ValueError(
           '`inference_mode` must be a string in '
-          f'{list(_BUILTIN_INFERENCE_MODES.keys())} or a `CustomInferenceMode`. '
-          f'Got inference_mode={inference_mode}.')
+          f'{list(_BUILTIN_INFERENCE_MODES.keys())} or a '
+          f'`CustomInferenceMode`. Got inference_mode={inference_mode}.'
+      )
 
   inference_mode = typing.cast(CustomInferenceMode, inference_mode)
 
@@ -339,6 +341,8 @@ def create_inference_function(
       kwargs = {}
       if decoder_params:
         kwargs['decoder_params'] = decoder_params
+      if model_fn_extra_kwargs:
+        kwargs.update(model_fn_extra_kwargs)
       # pytype: disable=wrong-keyword-args
       return model.predict_batch_with_aux(params, batch, **kwargs)
       # pytype: enable=wrong-keyword-args
@@ -351,7 +355,8 @@ def create_inference_function(
     model_fn = jax2tf.convert(
         model_fn,
         polymorphic_shapes=[None, polymorphic_shapes_inputs],
-        experimental_native_lowering=native_lowering,
+        native_serialization=native_lowering,
+        native_serialization_platforms=native_lowering_platforms,
         enable_xla=enable_xla,
     )
 
@@ -412,6 +417,74 @@ def create_single_tensor_input_signature(
     return (tf.TensorSpec([batch_size], tf.string, name=name),)
 
 
+def bucketize_tokenized_input(
+    input_tensor: tf.Tensor, bucket_keys: List[int]
+) -> tf.Tensor:
+  """Returns a scalar tf.Tensor indicates the bucketized length of the input_tensor.
+
+  Args:
+    input_tensor: A tokenized tf.Tensor.
+    bucket_keys: a bucket of sequence lengths, sorted ascendingly.
+  """
+  index = tf.searchsorted(bucket_keys, [tf.shape(input_tensor)[0]])
+  index = tf.math.minimum(index, len(bucket_keys) - 1)
+  index = tf.squeeze(index)
+  return tf.constant(bucket_keys)[index]
+
+
+def truncate_and_pad_tokenized_input(
+    input_tensor: tf.Tensor,
+    max_length: int,
+    allowed_lengths: Optional[list[int]] = None,
+) -> tf.Tensor:
+  """Truncate the examples to the maximum feature length, and pad to bucketed sequence lengths."""
+  if allowed_lengths:
+    allowed_lengths.sort()
+    if max_length != allowed_lengths[-1]:
+      raise ValueError(
+          'Expected the largest allowed length to be the same as the task'
+          f' feature length {max_length}, but got {allowed_lengths[-1]}.'
+      )
+    max_length = bucketize_tokenized_input(input_tensor, allowed_lengths)
+  input_tensor = input_tensor[:max_length]
+  input_tensor = tf.pad(
+      input_tensor, [[0, max_length - tf.shape(input_tensor)[0]]]
+  )
+  if not allowed_lengths:
+    input_tensor.set_shape([max_length])
+  return input_tensor
+
+
+def _build_ragged_feature_length_spec(
+    feature_key: str,
+    bucket_keys: Optional[Mapping[str, list[int]]],
+    task_feature_lengths: Mapping[str, int],
+) -> tf.RaggedTensorSpec:
+  """Build a spec of the feature tensor's sequence length after preprocessing.
+
+  The sequence length will be dynamic when polymorphic sequence length buckets
+  are configured for the given feature.
+  Args:
+    feature_key: The name of an input feature tensor.
+    bucket_keys: A mapping from feature key to allowed sequence lengths.
+    task_feature_lengths: A mapping from feature key to fixed sequence length.
+
+  Returns:
+    A RaggedTensorSpec representing the sequence length dimension of the
+    feature tensor.
+  """
+  if bucket_keys and feature_key in bucket_keys:
+    # Polymorphic sequence length.
+    feature_length = None
+  else:
+    feature_length = task_feature_lengths[feature_key]
+  return tf.RaggedTensorSpec(
+      shape=[feature_length],
+      dtype=tf.int32,
+      ragged_rank=0,
+  )
+
+
 # TODO(danielandor): More principled score-mode input format.
 def create_preprocessor(
     batch_size: Optional[int],
@@ -421,6 +494,7 @@ def create_preprocessor(
     *,
     input_tensor_name: str = 'text_batch',
     split_separator: Optional[str] = None,
+    bucket_keys: Optional[Mapping[str, List[int]]] = None,
 ) -> Tuple[PreprocessorFn, Sequence[tf.TensorSpec]]:
   """Builds a function based on the config task to tokenize and batch the input text.
 
@@ -438,6 +512,7 @@ def create_preprocessor(
       sets the target text for scoring to the second element. If None, the
       target is set to the empty string. The latter is appropriate for predict
       mode.
+    bucket_keys: If given, bucketizes the tensors according to bucket_keys.
 
   Returns:
     The preprocessor function.
@@ -457,7 +532,6 @@ def create_preprocessor(
           input_texts, sep=split_separator, maxsplit=1)
       split = ragged_split.to_tensor(shape=[tf.shape(input_texts)[0], 2])
       inputs, targets = split[:, 0], split[:, 1]
-    features = dict(inputs=inputs, targets=targets)
 
     # TODO(b/188656799): Generalize this code to work with arbitrary models.
     def featurize(text, k):
@@ -473,21 +547,35 @@ def create_preprocessor(
         # which uses seqio.preprocessors.append_eos_after_trim, implemented at:
         # https://github.com/google/seqio/tree/main/seqio/preprocessors.py;l=250;rcl=480228505
         t = tf.concat([t[:length - 1], [vocab.eos_id]], axis=0)
-      t = t[:length]
-      t = tf.pad(t, [[0, length - tf.shape(t)[0]]])
-      t.set_shape([length])
+      allowed_lengths = bucket_keys.get(k) if bucket_keys else None
+      t = truncate_and_pad_tokenized_input(
+          t, max_length=length, allowed_lengths=allowed_lengths
+      )
       ar_inputs = seqio.feature_converters.autoregressive_inputs(t)
       loss_weights = seqio.feature_converters.non_padding_position(t)
       return t, ar_inputs, loss_weights
 
+    encoder_output_signature = _build_ragged_feature_length_spec(
+        'inputs', bucket_keys, task_feature_lengths
+    )
     encoder_input_tokens, _, _ = tf.map_fn(
         functools.partial(featurize, k='inputs'),
-        features['inputs'],
-        fn_output_signature=(tf.int32, tf.int32, tf.int32))
+        inputs,
+        fn_output_signature=(encoder_output_signature,) * 3,
+    )
+    encoder_input_tokens = encoder_input_tokens.to_tensor()
+
+    decoder_output_signature = _build_ragged_feature_length_spec(
+        'targets', bucket_keys, task_feature_lengths
+    )
     decoder_target_tokens, decoder_input_tokens, loss_weights = tf.map_fn(
         functools.partial(featurize, k='targets'),
-        features['targets'],
-        fn_output_signature=(tf.int32, tf.int32, tf.int32))
+        targets,
+        fn_output_signature=(decoder_output_signature,) * 3,
+    )
+    decoder_target_tokens = decoder_target_tokens.to_tensor()
+    decoder_input_tokens = decoder_input_tokens.to_tensor()
+    loss_weights = loss_weights.to_tensor()
 
     return dict(
         encoder_input_tokens=encoder_input_tokens,
@@ -506,22 +594,26 @@ def create_dual_encoder_preprocessor(
     task_feature_lengths: Mapping[str, int],
     tokenized_inputs: bool = False,
     input_tensor_name: str = 'text_batch',
+    bucket_keys: Optional[Mapping[str, List[int]]] = None,
+    split_separator: Optional[str] = None,
 ) -> Tuple[PreprocessorFn, Sequence[tf.TensorSpec]]:
   """Builds a function based on the config task to tokenize and batch the input text."""
 
   def preprocess(input_texts: tf.Tensor) -> Mapping[str, tf.Tensor]:
     """TF-based preprocessor that takes a batch of text and converts it to model features."""
-    inputs = input_texts
     if tokenized_inputs:
+      inputs = input_texts
       targets = tf.broadcast_to(
           tf.constant(0, dtype=tf.int32), tf.shape(input_texts))
-    else:
+    elif split_separator is None:
+      inputs = input_texts
       targets = tf.broadcast_to(tf.constant(''), tf.shape(input_texts))
-
-    features = dict(
-        inputs=inputs,
-        targets=targets,
-    )
+    else:
+      ragged_split = tf.strings.split(
+          input_texts, sep=split_separator, maxsplit=1
+      )
+      split = ragged_split.to_tensor(shape=[tf.shape(input_texts)[0], 2])
+      inputs, targets = split[:, 0], split[:, 1]
 
     # TODO(b/188656799): Generalize this code to work with arbitrary models.
     def featurize(text, k):
@@ -534,19 +626,27 @@ def create_dual_encoder_preprocessor(
         t = text
       if output_features[k].add_eos:
         t = tf.concat([t[:length - 1], [vocab.eos_id]], axis=0)
-      t = t[:length]
-      t = tf.pad(t, [[0, length - tf.shape(t)[0]]])
-      t.set_shape([length])
+      allowed_lengths = bucket_keys.get(k) if bucket_keys else None
+      t = truncate_and_pad_tokenized_input(
+          t, max_length=length, allowed_lengths=allowed_lengths
+      )
       return t
 
     left_encoder_input_tokens = tf.map_fn(
         functools.partial(featurize, k='inputs'),
-        features['inputs'],
-        fn_output_signature=(tf.int32))
+        inputs,
+        fn_output_signature=_build_ragged_feature_length_spec(
+            'inputs', bucket_keys, task_feature_lengths
+        ),
+    ).to_tensor()
+
     right_encoder_input_tokens = tf.map_fn(
         functools.partial(featurize, k='targets'),
-        features['targets'],
-        fn_output_signature=(tf.int32))
+        targets,
+        fn_output_signature=_build_ragged_feature_length_spec(
+            'targets', bucket_keys, task_feature_lengths
+        ),
+    ).to_tensor()
 
     return dict(
         left_encoder_input_tokens=left_encoder_input_tokens,
@@ -561,6 +661,7 @@ def create_decoder_preprocessor(
     output_features: Mapping[str, seqio.Feature],
     task_feature_lengths: Mapping[str, int],
     tokenized_inputs: bool = False,
+    input_feature: str = 'inputs',
 ) -> PreprocessorFn:
   """Returns a function to tokenize and featurize inputs for decoder only models.
 
@@ -569,54 +670,43 @@ def create_decoder_preprocessor(
     task_feature_lengths: Mapping from 'inputs' and 'targets' to sequence
       lengths.
     tokenized_inputs: specifies whether the input is expected to be
-      pre-tokenized. If so, the preprocessor expects an int32 tensor of shape
-      [B, N] rather than a string tensor of shape [B].
+      pre-tokenized. If so, the preprocessor expects an int32 tensor padded with
+      0s to shape of [B, N] rather than a string tensor of shape [B].
+    input_feature: Name of the feature provided by `input_texts`, e.g., 'inputs'
+      or 'targets'.
   """
 
   def preprocess(input_texts: tf.Tensor) -> Mapping[str, tf.Tensor]:
     """TF-based preprocessor that takes a batch of text and converts it to model features."""
 
-    if tokenized_inputs:
-      inputs = input_texts  # actually an int32 tensor of shape [B, N].
-      targets = tf.broadcast_to(
-          tf.constant(0, dtype=tf.int32), tf.shape(input_texts))
-    else:
-      inputs = input_texts
-      targets = tf.broadcast_to(tf.constant(''), tf.shape(input_texts))
-
-    def tokenize(text, k):
-      vocab = output_features[k].vocabulary  # type: seqio.Vocabulary
+    def tokenize(text):
+      feature = output_features[input_feature]
+      vocab = feature.vocabulary  # type: seqio.Vocabulary
       if not tokenized_inputs:  # if inputs are tokenized, we don't re-tokenize.
         t = vocab.encode_tf(text)
       else:
         t = text
-      if output_features[k].add_eos:
+      if feature.add_eos:
         t = tf.concat([t, [vocab.eos_id]], axis=-1)
       return t
 
-    decoder_input_tokens = tf.map_fn(
-        functools.partial(tokenize, k='inputs'),
-        inputs,
-        fn_output_signature=(tf.int32))
+    decoder_tokens = tf.map_fn(
+        tokenize,
+        input_texts,
+        fn_output_signature=(tf.int32),
+    )
 
-    decoder_target_tokens = tf.map_fn(
-        functools.partial(tokenize, k='targets'),
-        targets,
-        fn_output_signature=(tf.int32))
-
-    decoder_target_tokens = tf.concat(
-        [decoder_input_tokens, decoder_target_tokens], axis=-1)
-
-    # Create 'inputs_width' tensor in the same shape as decoder_target_tokens.
-    # It is the length of 'inputs' tiled across length dimension and
-    # 'inputs_width_add_pos' is the same except that it has one additional
-    # position tensor.
-    inputs_length = tf.shape(decoder_input_tokens)[-1]
-    if output_features['inputs'].add_eos:
-      inputs_length -= 1
-    inputs_width = tf.fill(tf.shape(decoder_target_tokens), inputs_length)
-    inputs_width_add_pos = tf.fill(
-        tf.shape(decoder_target_tokens), inputs_length + 1)
+    if input_feature == 'inputs':
+      # 'inputs_width' is the length of 'inputs' (excluding padding 0).
+      ragged_input_tokens = tf.RaggedTensor.from_tensor(
+          decoder_tokens, padding=0
+      )
+      inputs_length = tf.cast(ragged_input_tokens.row_lengths(), dtype=tf.int32)
+      inputs_width = tf.expand_dims(inputs_length, -1)
+      inputs_width_add_pos = inputs_width + 1
+    else:
+      inputs_width = tf.zeros(tf.shape(decoder_tokens)[0], dtype=tf.int32)
+      inputs_width_add_pos = inputs_width
 
     def featurize(text, length):
       text = text[:length]
@@ -628,26 +718,21 @@ def create_decoder_preprocessor(
       return text, ar_inputs, loss_weights
 
     targets_length = sum(task_feature_lengths.values())
-    inputs_width, _, _ = tf.map_fn(
-        functools.partial(featurize, length=targets_length),
-        inputs_width,
-        fn_output_signature=(tf.int32, tf.int32, tf.int32))
-    inputs_width_add_pos, _, _ = tf.map_fn(
-        functools.partial(featurize, length=targets_length),
-        inputs_width_add_pos,
-        fn_output_signature=(tf.int32, tf.int32, tf.int32))
-    decoder_target_tokens, decoder_input_tokens, decoder_loss_weights = tf.map_fn(
-        functools.partial(featurize, length=targets_length),
-        decoder_target_tokens,
-        fn_output_signature=(tf.int32, tf.int32, tf.int32))
-
+    decoder_target_tokens, decoder_input_tokens, decoder_loss_weights = (
+        tf.map_fn(
+            functools.partial(featurize, length=targets_length),
+            decoder_tokens,
+            fn_output_signature=(tf.int32, tf.int32, tf.int32),
+        )
+    )
     positions = tf.range(tf.shape(decoder_target_tokens)[-1])
     positions = tf.repeat([positions],
                           tf.shape(decoder_target_tokens)[0],
                           axis=0)
 
     decoder_causal_attention = tf.cast(
-        positions < inputs_width_add_pos, dtype=decoder_target_tokens.dtype)
+        positions < inputs_width_add_pos, dtype=decoder_target_tokens.dtype
+    )
 
     inputs = positions < inputs_width
     padding_mask = tf.cast(decoder_loss_weights, dtype=tf.bool)
@@ -876,7 +961,9 @@ def create_postprocessor(
     vocab: seqio.Vocabulary,
     inference_mode: Union[str, CustomInferenceMode],
     decode_outputs: bool = True,
-    output_feature_names: Optional[List[str]] = None) -> PostprocessorFn:
+    output_feature_names: Optional[List[str]] = None,
+    add_token_length_to_output: Optional[bool] = False,
+) -> PostprocessorFn:
   """Creates a TF postprocessor function.
 
   Args:
@@ -887,6 +974,12 @@ def create_postprocessor(
       e.g., ['output_a', 'output_b'] will tag the savedmodel output to obtain
       two entries with 'output_a' and 'output_b'. The order must match the
       outputs from the module.
+    add_token_length_to_output: A boolean to indicate whether to include token
+      length infomation in the output. If True, will append 'num_tokens' and
+      'num_tokens_before_eos' to the output. 'num_tokens' indicates the length
+      of the decoder's output.  'num_tokens_before_eos' will count the tokens
+      until the first 'vocab.eos_id' (excluding the 'eos_id'), or the same as
+      'num_tokens' if 'vocab.eos_id' is None.
 
   Returns:
     A function that that post processing on inference outputs.
@@ -898,6 +991,32 @@ def create_postprocessor(
       tokens, scores = values
       if decode_outputs:
         decoded = vocab.decode_tf(tokens)
+        if add_token_length_to_output:
+          num_tokens = tf.reduce_sum(
+              tf.ones_like(tokens, dtype=tf.int32), axis=-1
+          )
+          if vocab.eos_id:
+            after_eos = tf.cumsum(
+                tf.cast(tf.equal(tokens, vocab.eos_id), tf.int32),
+                axis=-1,
+            )
+            before_eos = tf.cast(
+                tf.logical_not(tf.cast(after_eos, tf.bool)), tf.int32
+            )
+            num_tokens_before_eos = tf.reduce_sum(before_eos, axis=-1)
+          else:
+            num_tokens_before_eos = num_tokens
+          if isinstance(decoded, tf.RaggedTensor):
+            decoded = decoded.to_tensor()
+          return _maybe_name_outputs(
+              feature_values=(
+                  decoded,
+                  scores,
+                  num_tokens,
+                  num_tokens_before_eos,
+              ),
+              feature_names=output_feature_names,
+          )
         # If add_eos=False, vocab.decode_tf returns a tf.Tensor rather than
         # a tf.RaggedTensor.
         if isinstance(decoded, tf.RaggedTensor):
@@ -924,12 +1043,15 @@ def _request_for_batch(
     signature_name: str,
     batch_size: Optional[int],
     decoder_params_spec: Optional[DecoderParamsSpec] = None,
+    input_tensor_dtype: Optional[tf.DType] = None,
 ) -> predict_pb2.PredictRequest:
   """Adds a single batch of Predict warmup data."""
   request = predict_pb2.PredictRequest()
   request.model_spec.name = model_name
   request.model_spec.signature_name = signature_name
-  if text_batch and isinstance(text_batch[0], (str, bytes)):
+  if input_tensor_dtype is not None:
+    dtype = input_tensor_dtype
+  elif text_batch and isinstance(text_batch[0], (str, bytes)):
     dtype = tf.string
   else:
     dtype = tf.int32
@@ -958,18 +1080,39 @@ def _request_to_prediction_log(
   )
 
 
+def generate_examples_with_sequence_lengths(
+    sequence_lengths: list[int], single_token_example: WarmupExample = 'Q'
+) -> list[WarmupExamples]:
+  """Creates synthetic sequences of specified sizes by repeating a single token.
+
+  Args:
+    sequence_lengths: The sequence lengths to generate examples for.
+    single_token_example: An example such that `N*ex` is always `N` tokens long.
+      This is used to build sequences of a specified size. Defaults to `'Q'`,
+      which satisfies this property for the tokenizer used by pretrained T5X
+      models.
+
+  Returns:
+    A list of WarmupExamples batches with lengths in tokens equal to
+    `sequence_lengths`.
+  """
+  return [[single_token_example * l] for l in sequence_lengths]
+
+
 def write_warmup_examples(
     text_batch: WarmupExamples,
     output_dir: str,
     model_name: str,
     signature_name: str,
     *,
+    generate_examples_fn: Optional[Callable[[], list[WarmupExamples]]] = None,
     batch_sizes: List[Optional[int]],
     input_tensor_name: str = 'text_batch',
     decoder_params_spec: Optional[DecoderParamsSpec] = None,
     request_to_prediction_log: Callable[
         [predict_pb2.PredictRequest], prediction_log_pb2.PredictionLog
     ] = _request_to_prediction_log,
+    input_tensor_dtype: Optional[tf.DType] = None,
 ):
   """Writes warmup examples for all batch_sizes requested.
 
@@ -984,6 +1127,12 @@ def write_warmup_examples(
     output_dir: The directory for writing the warmup examples to.
     model_name: The name of the savedmodel spec.
     signature_name: Optional name of the exported function.
+    generate_examples_fn: An optional no-arg function that generates a list of
+      synthetic warmup batches. If provided, `text_batch` will be ignored, and
+      all synthetic batches will be written out, for all batch sizes. NOTE: This
+      differs from `text_batch`, which only supplies a single batch of examples
+      that are written together, instead of many batches that are written
+      separately.
     batch_sizes: A list of batch sizes to warmup with. The written number of
       tfrecords will be equal to the size of batch_sizes. The list might contain
       None entries, and the warmup examples for the None entry won't be padded
@@ -994,23 +1143,35 @@ def write_warmup_examples(
       examples.
     request_to_prediction_log: A function that creates a PredictionLog from a
       given request.
+    input_tensor_dtype: The dtype of the input tensor.
   """
+  if generate_examples_fn:
+    logging.warning(
+        'Ignoring provided warmup batch. Using `generate_examples_fn` to'
+        ' generate warmup examples instead.'
+    )
+    warmup_examples = generate_examples_fn()
+  else:
+    warmup_examples = [text_batch]
+
   assets_extra = os.path.join(output_dir, 'assets.extra')
   tf.io.gfile.makedirs(assets_extra)
   warmup_output = os.path.join(assets_extra, 'tf_serving_warmup_requests')
   with tf.io.TFRecordWriter(warmup_output) as writer:
-    for batch_size in batch_sizes:
-      logging.info('Writing warmup data for batch size: %s ...', batch_size)
-      request = _request_for_batch(
-          text_batch,
-          model_name,
-          input_tensor_name,
-          signature_name,
-          batch_size,
-          decoder_params_spec,
-      )
-      log = request_to_prediction_log(request)
-      writer.write(log.SerializeToString())
+    for warmup_example in warmup_examples:
+      for batch_size in batch_sizes:
+        logging.info('Writing warmup data for batch size: %s ...', batch_size)
+        request = _request_for_batch(
+            warmup_example,
+            model_name,
+            input_tensor_name,
+            signature_name,
+            batch_size,
+            decoder_params_spec,
+            input_tensor_dtype,
+        )
+        log = request_to_prediction_log(request)
+        writer.write(log.SerializeToString())
 
 
 
@@ -1034,7 +1195,8 @@ def _standardize_output_features(
 
 
 def _standardize_output_dirs(output_dir: Union[str, Mapping[str, str]]):
-  """standardize the format of output_dirs from user input."""
+  """Standardize the format of output_dirs from user input."""
+  logging.info('Standardizing the output_dir: %s', output_dir)
   if output_dir is None:
     raise ValueError('output_dir is mandatory')
   if isinstance(output_dir, str):
@@ -1054,6 +1216,7 @@ def _standardize_output_dirs(output_dir: Union[str, Mapping[str, str]]):
     output_dirs['cpu'] = os.path.join(
         os.path.dirname(output_dirs['tpu']) + '_cpu', export_version
     )
+  logging.info('Result standardized output_dirs: %s', output_dirs)
   return output_dirs
 
 
@@ -1081,6 +1244,35 @@ def create_fake_input(signature: Dict[str, tf.TensorSpec]) -> Any:
   return jax.tree_util.tree_map(_gen_dummy_tensor, signature)
 
 
+def create_batch_polymorphic_shapes(
+    input_signature,
+    preprocessor,
+    *,
+    create_fake_input_fn=create_fake_input,
+    overrides=None,
+):
+  """Creates batch polymorhic shapes for jax2tf, and override specific shapes."""
+  is_poly_batch = not all(
+      s.shape.is_fully_defined()
+      for s in jax.tree_util.tree_leaves(input_signature)
+  )
+
+  # All shapes are static.
+  if not is_poly_batch and not overrides:
+    return None
+
+  fake_inputs = create_fake_input_fn(input_signature)
+  features = preprocessor(*fake_inputs)
+
+  # All the features have a leading batch dimension.
+  shapes = jax.tree_util.tree_map(
+      lambda _: 'b, ...' if is_poly_batch else None, features
+  )
+  if overrides:
+    shapes.update(overrides)
+  return shapes
+
+
 def save(
     *,
     model: models.BaseTransformerModel,
@@ -1088,8 +1280,11 @@ def save(
     restore_checkpoint_cfg: utils.RestoreCheckpointConfig,
     exportable_module_cls: Type[ExportableModule],
     create_preprocessor_fn: CreatePreprocessorFn = create_preprocessor,
+    create_inference_function_fn: Callable[
+        ..., InferenceFn
+    ] = create_inference_function,
     create_postprocessor_fn: CreatePostprocessorFn = create_postprocessor,
-    partitioner: Optional[partitioning.BasePartitioner],
+    partitioner: Optional[partitioning.BasePartitioner] = None,
     create_decoding_state_callback_fn: Optional[
         CreateDecodingStateCallbackFn
     ] = None,
@@ -1100,18 +1295,17 @@ def save(
     model_name: str,
     warmup_examples: Optional[WarmupExamples] = None,
     tokenized_inputs: bool = False,
-    write_warmup_example_fn=write_warmup_examples,
+    write_warmup_example_fn: Callable[..., None] = write_warmup_examples,
     mixture_or_task_name: Optional[str] = None,
     validation_examples: Optional[List[Any]] = None,
     native_lowering: bool = False,
+    native_lowering_platforms: Sequence[str] = (),
     enable_xla: bool = True,
     decode_outputs: Optional[bool] = None,
     trailing_shapes: Optional[Mapping[str, Tuple[int, ...]]] = None,
     output_vocab_feature_name: Optional[str] = 'targets',
-    signature_name: Optional[
-        str
-    ] = tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY,
-    create_fake_input_fn: Any = create_fake_input,
+    signature_name: str = tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY,
+    create_polymorphic_shapes_fn: Any = create_batch_polymorphic_shapes,
 ):
   """Saves the passed EncoderDecoderModel as a TPU-enabled TF SavedModel.
 
@@ -1121,6 +1315,7 @@ def save(
     restore_checkpoint_cfg: Configuration for restoring model from checkpoint.
     exportable_module_cls: A configured implementation of ExportableModule.
     create_preprocessor_fn: Configurable func. to create the PreprocessorFn.
+    create_inference_function_fn: Configurable func. to create the InferenceFn.
     create_postprocessor_fn: Configurable func. to create the PostprocessorFn.
     partitioner: Partitioner, usually for Pjit.
     create_decoding_state_callback_fn: Configurable func. to create an optional
@@ -1133,8 +1328,10 @@ def save(
       the final TPU-converted saved model. The CPU saved model will be saved to
       ${BASE}_cpu/${VERSION}, such that "_cpu" is appended to the base path but
       the numeric version is preserved. (b) A dict with key 'cpu' and as value
+      the path to write the CPU model to.
     model_name: Name of model, like "/ml/user/half_plus_two".
     warmup_examples: Optional list of warmup examples. If proveded, they will be
+      written in Predict mode to assets.extra.
     tokenized_inputs: if True, inputs are expected to be pre-tokenized before
       being passed to the Jax2TF converted model, e.g. an int32 tensor of type
       [B, L]. If False, inputs is expected to be a string tensor of shape [B].
@@ -1147,8 +1344,14 @@ def save(
       In order to set this output_features must be None.
     validation_examples: Optional list of validation examples. If proveded, they
       will be used to validate the latency and numeric accuracy of the TPU saved
+      model.
     native_lowering: for experimental purposes only -- if True, don't convert
       Jax fns to TF fns.
+    native_lowering_platforms: In conjunction with `native_lowering`, specify
+      the platform(s) for which to lower the code. Must be a tuple of strings,
+      including a subset of: 'cpu', 'cuda', 'rocm', 'tpu'. The default
+      (empty tuple), specifies the JAX default backend on the machine where the
+      lowering is done.
     enable_xla: Defaults to true. If false, jax2tf conversion only emits non-XLA
       ops.
     decode_outputs: Optional bool. If provided, determines whether to decode the
@@ -1159,11 +1362,10 @@ def save(
     output_vocab_feature_name: The vocabulary feature which maps decoded ids to
       plain text. For standard T5X models this will always be 'targets', but may
       be different or empty for other models.
-    signature_name: Optional name of the exported function.
-    create_fake_input_fn: Optional function to create fake inputs instead of
-      relying on signautres which would create all zeros and some preprocessors
-      might not work with zeros.
-  """
+    signature_name: Name of the exported function.
+    create_polymorphic_shapes_fn: Optional function to create polymorphic shapes
+      for input tensors to the JAX model function.
+  """  # fmt: skip
   jax.monitoring.record_event('/jax/t5x/export/beacon')
   output_dirs = _standardize_output_dirs(output_dir)
   del output_dir
@@ -1204,25 +1406,14 @@ def save(
 
   logging.info('Converting inference function...')
 
-  # The model_fn takes two arguments, the params and the inputs. The inputs are
-  # a pytree of arrays with the first dimension being the batch dimension.
-  if batch_size is None:
-    fake_inputs = create_fake_input_fn(input_signature)
-    features = preprocessor(*fake_inputs)
-
-    # All the features have a leading batch dimension.
-    polymorphic_shapes_inputs = jax.tree_util.tree_map(lambda _: 'b, ...',
-                                                       features)
-  else:
-    polymorphic_shapes_inputs = None
-
   decoding_state_callback_fn = None
   if create_decoding_state_callback_fn is not None:
     decoding_state_callback_fn = create_decoding_state_callback_fn(
-        vocab=output_vocab
+        vocab=output_vocab,
+        call_tf_graph=native_lowering,
     )
 
-  model_tf_fn = create_inference_function(
+  model_tf_fn = create_inference_function_fn(
       model=model,
       train_state_initializer=train_state_initializer,
       decoding_state_callback_fn=decoding_state_callback_fn,
@@ -1230,8 +1421,11 @@ def save(
       inference_mode=inference_mode,
       enable_jax2tf=True,
       enable_xla=enable_xla,
-      polymorphic_shapes_inputs=polymorphic_shapes_inputs,
+      polymorphic_shapes_inputs=create_polymorphic_shapes_fn(
+          input_signature, preprocessor
+      ),
       native_lowering=native_lowering,
+      native_lowering_platforms=native_lowering_platforms,
   )
 
   logging.info('Loading parameters from checkpoint...')
@@ -1251,6 +1445,7 @@ def save(
       params=params,
       batch_size=batch_size,
   )
+  module.preproc_func.get_concrete_function(*input_signature)
   signatures = {
       signature_name: module.__call__.get_concrete_function(*input_signature)
   }

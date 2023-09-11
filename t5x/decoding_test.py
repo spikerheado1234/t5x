@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -217,8 +217,7 @@ class DecodeTest(parameterized.TestCase):
       for j in range(max_decode_len):
         rng1, rng = jax.random.split(rng)
         # We want to sift out `j` for which rng1 == rng_input
-        # rngs are a pair of ints. So sum the bool and divide by 2.
-        k += j * (rng1 == rng_input).sum() // 2
+        k += j * (rng1 == rng_input).all()
       # `k` at this point is equal to the while loop variable `i` of the caller.
       return ret[k]
 
@@ -296,8 +295,7 @@ class DecodeTest(parameterized.TestCase):
       for j in range(max_decode_len):
         rng1, rng = jax.random.split(rng)
         # We want to sift out `j` for which rng1 == rng_input
-        # rngs are a pair of ints. So sum the bool and divide by 2.
-        k += j * (rng1 == rng_input).sum() // 2
+        k += j * (rng1 == rng_input).all()
       # `k` at this point is equal to the while loop variable `i` of the caller.
       return ret[k]
 
@@ -776,10 +774,10 @@ class DecodeTest(parameterized.TestCase):
                 'cached_key': jnp.ones([10, 12, 2]),
                 'cached_values': jnp.ones([4, 7, 2]),
                 'cache_index': jnp.ones([4, 5, 6]),
-            }
+            },
         },
         'position_embedder': {
-            'position_embedder_index': jnp.array(-1),
+            'position_embedder_index': jnp.array([-1]),
         },
     }
 
@@ -789,9 +787,11 @@ class DecodeTest(parameterized.TestCase):
         'layers_0': {
             'cached_key': fn(jnp.ones([3, 6])),
             'cached_values': fn(jnp.ones([3, 6])),
-            'cache_index': fn(jnp.ones([
-                3,
-            ])),
+            'cache_index': fn(
+                jnp.ones([
+                    3,
+                ])
+            ),
         },
         'layers_1': {
             'relpos_bias': {
@@ -806,10 +806,10 @@ class DecodeTest(parameterized.TestCase):
                 'cached_key': fn(jnp.ones([10, 12, 2])),
                 'cached_values': fn(jnp.ones([4, 7, 2])),
                 'cache_index': fn(jnp.ones([4, 5, 6])),
-            }
+            },
         },
         'position_embedder': {
-            'position_embedder_index': jnp.array(-1),
+            'position_embedder_index': jnp.array([-1]),
         },
     }
 

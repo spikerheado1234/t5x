@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,6 @@ import clu.metrics
 import clu.values
 from flax.core import FrozenDict
 import jax
-from jax.experimental import multihost_utils
 import jax.lax
 import jax.numpy as jnp
 import jax.random
@@ -70,6 +69,11 @@ else:
 def _merge_metrics(a, b):
   return jax.tree_util.tree_map(
       lambda a, b: a.merge(b), a, b, is_leaf=metrics_lib.is_metric_obj)
+
+
+def _time() -> float:
+  """Indirection to `time.time` for mocking."""
+  return time.time()
 
 
 # Merges two metrics pytrees (mapping of metric_name (str) to clu.Metric object)
@@ -242,7 +246,7 @@ class _AsyncTimer(object):
                                       "called on deleted or donated buffer")
         if str(e) not in (buffer_deleted_message, gda_buffer_deleted_message):
           raise
-      return time.time()
+      return _time()
 
     return self._pool(_get_completion_time)()
 
@@ -273,7 +277,11 @@ class MetricsManager(object):
   You should call close() to wait for threads started by this class to finish.
   """
 
-  def __init__(self, name: str, summary_dir: Optional[str] = None):
+  def __init__(
+      self,
+      name: str,
+      summary_dir: Optional[str] = None,
+  ):
     """MetricsManager constructor.
 
     Constructs an empty MetricWriter on all but host 0.
@@ -285,10 +293,7 @@ class MetricsManager(object):
     """
     self._name = name
     if jax.process_index() == 0:
-      self._writer = metric_writers.create_default_writer(
-          summary_dir,
-          collection=name,
-          asynchronous=True)
+      self._writer = self._create_writer(name, summary_dir)
     else:
       self._writer = metric_writers.MultiWriter([])
     self.summary_dir = os.path.join(summary_dir, name) if summary_dir else None
@@ -296,9 +301,20 @@ class MetricsManager(object):
     # We use a thread pool with a single worker to ensure that calls to the
     # function are run in order (but in a background thread).
     self._summary_pool = asynclib.Pool(
-        thread_name_prefix="MetricsManager", max_workers=1)
+        thread_name_prefix="MetricsManager", max_workers=1
+    )
     # Times the duration between steps.
     self._duration_timer = _AsyncTimer()
+
+  def _create_writer(
+      self, name: str, summary_dir: Optional[str] = None
+  ) -> metric_writers.MetricWriter:
+    """Creates the writer for host 0."""
+    return metric_writers.create_default_writer(
+        summary_dir,
+        collection=name,
+        asynchronous=True,
+    )
 
   def __del__(self):
     self.close()
@@ -318,6 +334,7 @@ class MetricsManager(object):
   def summary_writer(self) -> metric_writers.MetricWriter:
     """Returns the MetricWriter used by this class."""
     # TODO(adarob): Make returned writer threadsafe.
+    assert self._writer is not None
     return self._writer
 
   def write_scalar(self, key: str, val: metric_writers.interface.Scalar,
@@ -441,7 +458,7 @@ class BaseTrainer(abc.ABC):
     self.stop_training = False
 
     # Time since the trainer was made, this will record the "uptime" of the job.
-    self._trainer_init_time = time.time()
+    self._trainer_init_time = _time()
 
     # The training metrics combine metrics added by the Model (e.g., loss and
     # accuracy) and Trainer (e.g., learning rate).
@@ -511,7 +528,8 @@ class BaseTrainer(abc.ABC):
 
     if metrics is not None:
       metrics["timing/uptime"] = clu.metrics.LastValue.from_model_output(
-          jnp.asarray([time.time() - self._trainer_init_time]))
+          jnp.asarray([_time() - self._trainer_init_time])
+      )
 
     return self.train_metrics_manager.write_metrics_summary(
         metrics, start_step + num_steps, num_steps)
@@ -529,10 +547,10 @@ class BaseTrainer(abc.ABC):
       batch: A sample batch that may contain dummy values, but with correct
         shapes and dtypes.
     """
-    tick = time.time()
+    tick = _time()
     self._compiled_train_step = self._partitioner.compile(
         self._partitioned_train_step, self.train_state, batch)
-    tock = time.time()
+    tock = _time()
     self.train_metrics_manager.write_scalar("timing/compilation_seconds",  # pytype: disable=wrong-arg-types  # jax-ndarray
                                             tock - tick, self.train_state.step)
 
@@ -557,10 +575,12 @@ class BaseTrainer(abc.ABC):
         utils.multihost_assert_equal(
             jnp.array(num_steps),
             "Eval step mismatch across hosts. Check for empty dataset shard.")
-        if jax.config.jax_array and jax.process_count() > 1:
-          batch = multihost_utils.host_local_array_to_global_array(
-              batch, self._partitioner.mesh,
-              self._partitioner.data_partition_spec)
+        if jax.process_count() > 1:
+          batch = partitioning.host_local_array_to_global_array(
+              batch,
+              self._partitioner.mesh,
+              self._partitioner.data_partition_spec,
+          )
         metrics_update = eval_step_fn(train_state, batch)
         if metrics:
           metrics = merge_metrics(metrics, metrics_update)
@@ -596,18 +616,20 @@ class BaseTrainer(abc.ABC):
         correct.
     """
     for eval_name, batch in batches.items():
-      tick = time.time()
+      tick = _time()
       cache_key: BatchSpec = FrozenDict(jax.eval_shape(lambda: batch))  # pylint:disable=cell-var-from-loop
       if cache_key not in self._compiled_eval_step_cache:
-        if jax.config.jax_array and jax.process_count() > 1:
-          batch = multihost_utils.host_local_array_to_global_array(
-              batch, self._partitioner.mesh,
-              self._partitioner.data_partition_spec)
+        if jax.process_count() > 1:
+          batch = partitioning.host_local_array_to_global_array(
+              batch,
+              self._partitioner.mesh,
+              self._partitioner.data_partition_spec,
+          )
         self._compiled_eval_step_cache[cache_key] = self._partitioner.compile(
             self._partitioned_eval_step, self.train_state, batch)
       self._compiled_eval_steps[eval_name] = self._compiled_eval_step_cache[
           cache_key]
-      tock = time.time()
+      tock = _time()
       self.eval_metrics_managers[eval_name].write_scalar(  # pytype: disable=wrong-arg-types  # jax-ndarray
           "timing/compilation_seconds", tock - tick, self.train_state.step)
 
@@ -660,7 +682,9 @@ def accumulate_grads_microbatched(
   # Note: Default t5x models don't support flax_mutables. One needs to subclass
   # them and return flax_mutables from `get_initial_variables` and `loss_fn`.
 
-  initial_flax_mutables = train_state.flax_mutables if train_state.flax_mutables else None
+  initial_flax_mutables = (
+      train_state.flax_mutables if train_state.flax_mutables else None
+  )
 
   if num_microbatches is None or num_microbatches <= 1:
 
@@ -728,7 +752,11 @@ def accumulate_grads_microbatched(
     grad_accum_init = jax.tree_util.tree_map(
         lambda x: jnp.zeros(x.shape, accum_dtype), train_state.params)
     initial_metrics_shape, _, _ = jax.eval_shape(
-        metrics_and_grad, loop_cnt=0, dropout_rng=dropout_rng)
+        metrics_and_grad,
+        loop_cnt=0,
+        dropout_rng=dropout_rng,
+        flax_mutables=initial_flax_mutables,
+    )
 
     initial_metrics = {
         k: metrics_lib.shape_obj_to_defined_obj(v)
@@ -786,7 +814,18 @@ def apply_grads(
 def eval_step(model: models.BaseModel, train_state: train_state_lib.TrainState,
               batch: jnp.ndarray) -> MetricMapType:
   """Default evaluation step."""
-  _, metrics = model.eval_fn(train_state.params, batch)  # pytype: disable=wrong-arg-types  # jax-ndarray
+  if not train_state.flax_mutables:
+    _, metrics = model.eval_fn(train_state.params, batch)  # pytype: disable=wrong-arg-types  # jax-ndarray
+  else:
+    # If the training state contains mutable variables, then we expect the
+    # model to accept this extra arguments in the eval function.
+    # pytype: disable=wrong-arg-count
+    # pytype: disable=wrong-arg-types
+    _, metrics = model.eval_fn(
+        train_state.params, batch, train_state.flax_mutables
+    )
+    # pytype: enable=wrong-arg-count
+    # pytype: enable=wrong-arg-types
   return metrics
 
 
@@ -1017,13 +1056,17 @@ class EarlyStoppingAction(BaseAction):
 
     m = metrics_by_task[self._task][self._metric]
 
-    if not isinstance(m, clu.values.Scalar):
+    if isinstance(m, clu.values.Scalar):
+      self._metric_history.append(m.value)
+
+    # For metrics returned from action_mode=INFER_EVAL (i.e. seqio.Evaluator)
+    elif isinstance(m, float):
+      self._metric_history.append(m)
+    else:
       logging.warning("Metric %s does not have Scalar type. Found %s.",
                       self._metric, type(m))
       _warn_action_not_run(type(self), self._task, self._metric)
       return False
-
-    self._metric_history.append(m.value)
 
     # Not enough history.
     if len(self._metric_history) < self._patience:

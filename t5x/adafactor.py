@@ -1,4 +1,4 @@
-# Copyright 2022 The T5X Authors.
+# Copyright 2023 The T5X Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ parameters.
 """
 import enum
 import re
+import typing
 from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 from absl import logging
@@ -82,7 +83,7 @@ class HeuristicRule(enum.Enum):
 
 
 HEURISTIC_RULE = HeuristicRule.token
-FactorRule = Union[HeuristicRule, Tuple[FactorDim]]
+FactorRule = Union[HeuristicRule, Tuple[FactorDim, ...]]
 
 
 def _restore(target, flat):
@@ -240,7 +241,7 @@ class Adafactor(OptimizerDef):
       dtype_momentum: dtype of momentum buffers.
       factor_map: hparam-map from key path to manual factorization rules.
       logical_factor_rules: factorization rules provided as a set of mappings
-        from logical axis name to ROW, COLUMN, BATCH, or NONE.  Supercedes
+        from logical axis name to ROW, COLUMN, BATCH, or NONE.  Supersedes
         factor_map if `set_param_axes` is called.
       weight_decay_rate_lr_exponent: If present, weight decay rate is computed
         as (learning_rate ** weight_decay_rate_lr_exponent).  If
@@ -250,8 +251,8 @@ class Adafactor(OptimizerDef):
       max_parameter_scale: If set, clips the parameter scale to a maximum value,
         which helps prevent parameters from growing without bound.
       skip_nan_updates: If set, any parameter that would have been updated by a
-        NaN value after a applying gradients will be kept with the earlier
-        value it had.
+        NaN value after a applying gradients will be kept with the earlier value
+        it had.
     """
     if not factored and factor_map is not None:
       raise ValueError('Adafactor factored is False but factorization rules '
@@ -274,6 +275,17 @@ class Adafactor(OptimizerDef):
         global_norm_clip_threshold, max_parameter_scale, skip_nan_updates)
     self.dtype_momentum = jax.dtypes.canonicalize_dtype(dtype_momentum)
     super().__init__(hyper_params)
+
+  def __eq__(self, other: Any) -> bool:
+    if not isinstance(other, Adafactor):
+      return False
+    return (
+        self.hyper_params == other.hyper_params
+        and self.dtype_momentum == other.dtype_momentum
+    )
+
+  def __hash__(self) -> int:
+    return id(self)
 
   @staticmethod
   def _decay_rate_pow(i: int, exponent: float = 0.8) -> float:
@@ -385,6 +397,12 @@ class Adafactor(OptimizerDef):
     if factored_dims is HEURISTIC_RULE:
       factored_dims = self._factored_dims(shape)
     if factored_dims is not None:
+      # We have ruled out the types None and HeuristicRule, so there's only one
+      # remaining type. (This line is a no-op but is helpful for static type
+      # analyzers.)
+      factored_dims = typing.cast(
+          Tuple[Tuple[int, ...], Tuple[int, ...]], factored_dims
+      )
       d1, d0 = factored_dims
       vr_shape = np.delete(shape, d0)
       vc_shape = np.delete(shape, d1)
@@ -458,6 +476,12 @@ class Adafactor(OptimizerDef):
     if factored_dims is HEURISTIC_RULE:
       factored_dims = self._factored_dims(param.shape)
     if factored_dims is not None:
+      # We have ruled out the types None and HeuristicRule, so there's only one
+      # remaining type. (This line is a no-op but is helpful for static type
+      # analyzers.)
+      factored_dims = typing.cast(
+          Tuple[Tuple[int, ...], Tuple[int, ...]], factored_dims
+      )
       d1, d0 = factored_dims
       new_v_row = (
           decay_rate * state.v_row + mixing_rate * jnp.mean(grad_sqr, axis=d0))
