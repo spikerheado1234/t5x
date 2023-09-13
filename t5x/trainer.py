@@ -915,6 +915,8 @@ class Trainer(BaseTrainer):
   def _partitioned_train_step(self) -> PartitionedTrainCallable:
 
     def train_step(train_state: train_state_lib.TrainState, batch: BatchType):
+      import pdb
+      pdb.set_trace()
       return train_with_lr(
           train_state,
           batch,

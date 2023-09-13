@@ -149,6 +149,7 @@ def dot_product_attention(query: Array,
   Returns:
     Output of shape `[batch, length, num_heads, v_depth_per_head]`.
   """
+  raise Exception("Scalable T5 attention used.")
   assert key.ndim == query.ndim == value.ndim, 'q, k, v must have same rank.'
   assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], (
       'q, k, v batch dims must match.')

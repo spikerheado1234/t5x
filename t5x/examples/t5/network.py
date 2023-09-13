@@ -92,6 +92,7 @@ class EncoderLayer(nn.Module):
 
     return y
 
+import pdb
 
 class DecoderLayer(nn.Module):
   """Transformer decoder layer that attends to the encoder."""
@@ -117,7 +118,7 @@ class DecoderLayer(nn.Module):
     x = layers.LayerNorm(
         dtype=cfg.dtype, name='pre_self_attention_layer_norm')(
             inputs)
-
+    pdb.set_trace()
     # Self-attention block
     x = layers.MultiHeadDotProductAttention(
         num_heads=cfg.num_heads,
