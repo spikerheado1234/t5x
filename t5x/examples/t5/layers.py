@@ -67,7 +67,8 @@ def performer_dot_product_attention(query: Array,
     key: `[batch, kv_length, num_heads, qk_depth_per_head]`.
     value: `[batch, kv_length, num_heads, v_depth_per_head]`. 
   """
-  raise Exception('Performer exeucting exception thrown')
+  print('performer executing')
+  assert False, "Performer executing"
   assert key.ndim == query.ndim == value.ndim, 'q, k, v must have same rank.'
   assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], (
       'q, k, v batch dims must match.')
@@ -81,8 +82,8 @@ def performer_dot_product_attention(query: Array,
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
   
-  queries = nn.relu(query) 
-  keys = nn.relu(key) 
+  queries = nn.relu(query) + numerical_stabilizer 
+  keys = nn.relu(key) + numerical_stabilizer
 
   ## We then do a transposition. ##
   queries = jnp.transpose(queries, [1, 0, 2, 3]) # -> this is [q_length, batch, num_heads, qk_depth_per_head].
