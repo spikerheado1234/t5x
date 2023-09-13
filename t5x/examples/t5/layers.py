@@ -68,6 +68,7 @@ def performer_dot_product_attention(query: Array,
     value: `[batch, kv_length, num_heads, v_depth_per_head]`. 
   """
   print('performer executing')
+  assert False, "Performer executing"
   assert key.ndim == query.ndim == value.ndim, 'q, k, v must have same rank.'
   assert query.shape[:-3] == key.shape[:-3] == value.shape[:-3], (
       'q, k, v batch dims must match.')
